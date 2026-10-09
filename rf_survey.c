@@ -77,7 +77,11 @@ static bool tune_rx(uint32_t f) {
 #define MAX_BINS   1024 // enough for a full 300-928 MHz sweep @650k (~967 bins); int8 -> 2 KB
 #define VIEW_SPEC  0
 #define VIEW_CONF  1
+#define VIEW_RANGE 2 // custom start/end frequency editor
 #define SCR_W      128
+#define RE_MIN     3000 // 300.0 MHz in 100 kHz units (the CC1101 low-band floor)
+#define RE_MAX     9280 // 928.0 MHz
+#define RE_SPAN    10 // minimum span: 1.0 MHz
 #define BASE_Y     50 // spectrum baseline (room for pill buttons below)
 #define MAX_H      28 // tallest bar
 #define BODY_Y0    22 // top of the page body
@@ -222,6 +226,12 @@ typedef struct {
     VariableItemList* conf; // config screen
     VariableItem* it_range; // "Range MHz" readout, updated when a band is picked
     VariableItem* it_preset; // "Modulation" preset (AM650/AM270/FM238/FM476)
+
+    // custom-range editor (VIEW_RANGE): start/end in 100 kHz units (779.0 MHz = 7790)
+    View* range_view;
+    uint32_t re_start, re_end;
+    uint8_t re_field; // 0 = editing Start, 1 = editing End
+    uint8_t re_cur; // active digit 0..3 (hundreds, tens, ones, tenths)
     FuriTimer* redraw;
 } App;
 
@@ -885,6 +895,117 @@ static uint32_t to_conf(void* ctx) {
     return VIEW_CONF; // Back from the spectrum returns to config
 }
 
+// ---- custom range editor (VIEW_RANGE) --------------------------------------
+// Styled after the stock Frequency Analyzer: the active field (Start or End) is a big
+// boxed number; Left/Right pick a digit, Up/Down change it, OK swaps Start<->End, Back
+// validates and applies. Values are in 100 kHz units (779.0 MHz = 7790).
+
+static const uint32_t RE_PLACE[4] = {1000, 100, 10, 1}; // hundreds, tens, ones, tenths
+
+static void range_draw(Canvas* canvas, void* model) {
+    UNUSED(model);
+    App* app = g_app;
+    if(!app) return;
+    canvas_clear(canvas);
+    uint32_t a = app->re_field ? app->re_end : app->re_start;
+    char big[12];
+    snprintf(big, sizeof(big), "%lu.%lu", (unsigned long)(a / 10), (unsigned long)(a % 10));
+
+    canvas_set_font(canvas, FontSecondary);
+    canvas_draw_str(canvas, 2, 9, app->re_field ? "End" : "Start");
+    canvas_draw_str(canvas, 108, 9, "MHz");
+
+    // inverted box with the big number (like the analyzer's locked readout)
+    canvas_draw_box(canvas, 2, 12, 124, 22);
+    canvas_set_color(canvas, ColorWhite);
+    canvas_set_font(canvas, FontBigNumbers);
+    canvas_draw_str(canvas, 6, 30, big);
+    // underline the active digit (digit idx -> char idx; the '.' is char 3)
+    int ci = app->re_cur < 3 ? app->re_cur : 4;
+    char pre[8];
+    memcpy(pre, big, (size_t)ci);
+    pre[ci] = 0;
+    int x0 = 6 + (int)canvas_string_width(canvas, pre);
+    char one[2] = {big[ci], 0};
+    int w = (int)canvas_string_width(canvas, one);
+    canvas_draw_line(canvas, x0, 32, x0 + (w > 0 ? w - 1 : 2), 32);
+    canvas_set_color(canvas, ColorBlack);
+
+    // the other field + the resulting span, below the box
+    canvas_set_font(canvas, FontSecondary);
+    uint32_t o = app->re_field ? app->re_start : app->re_end;
+    uint32_t span = (app->re_end > app->re_start) ? app->re_end - app->re_start : 0;
+    char info[40];
+    snprintf(
+        info,
+        sizeof(info),
+        "%s %lu.%lu  span %lu.%lu",
+        app->re_field ? "Start" : "End",
+        (unsigned long)(o / 10),
+        (unsigned long)(o % 10),
+        (unsigned long)(span / 10),
+        (unsigned long)(span % 10));
+    canvas_draw_str(canvas, 2, 46, info);
+
+    elements_button_left(canvas, "Digit");
+    elements_button_center(canvas, "Swap");
+    elements_button_right(canvas, "Set");
+}
+
+static bool range_input(InputEvent* e, void* ctx) {
+    UNUSED(ctx);
+    App* app = g_app;
+    if(!app) return false;
+    bool act = (e->type == InputTypeShort || e->type == InputTypeRepeat);
+
+    if(e->key == InputKeyBack && e->type == InputTypeShort) {
+        // validate: clamp to the CC1101 window and enforce a minimum span, then apply
+        if(app->re_start < RE_MIN) app->re_start = RE_MIN;
+        if(app->re_end > RE_MAX) app->re_end = RE_MAX;
+        if(app->re_end < app->re_start + RE_SPAN) {
+            app->re_end = app->re_start + RE_SPAN;
+            if(app->re_end > RE_MAX) {
+                app->re_end = RE_MAX;
+                app->re_start = RE_MAX - RE_SPAN;
+            }
+        }
+        app->f_start = app->re_start * 100000;
+        app->f_end = app->re_end * 100000;
+        app->reconfig = true;
+        char r[24];
+        snprintf(
+            r,
+            sizeof(r),
+            "%lu-%lu",
+            (unsigned long)(app->f_start / 1000000),
+            (unsigned long)(app->f_end / 1000000));
+        variable_item_set_current_value_text(app->it_range, r);
+        FURI_LOG_I(
+            TAG, "range: set %lu-%lu", (unsigned long)app->f_start, (unsigned long)app->f_end);
+        view_dispatcher_switch_to_view(app->vd, VIEW_CONF);
+        return true;
+    }
+
+    uint32_t* v = app->re_field ? &app->re_end : &app->re_start;
+    if(e->key == InputKeyOk && e->type == InputTypeShort) {
+        app->re_field ^= 1; // swap Start <-> End
+    } else if(e->key == InputKeyLeft && act) {
+        if(app->re_cur > 0) app->re_cur--;
+    } else if(e->key == InputKeyRight && act) {
+        if(app->re_cur < 3) app->re_cur++;
+    } else if(e->key == InputKeyUp && act) {
+        uint32_t nv = *v + RE_PLACE[app->re_cur];
+        *v = (nv > RE_MAX) ? RE_MAX : nv;
+    } else if(e->key == InputKeyDown && act) {
+        uint32_t p = RE_PLACE[app->re_cur];
+        *v = (*v > RE_MIN + p) ? (*v - p) : RE_MIN;
+    } else {
+        return true;
+    }
+    with_view_model(app->range_view, void** m, { UNUSED(m); }, true);
+    return true;
+}
+
 // ---- config screen ---------------------------------------------------------
 
 static void band_cb(VariableItem* item) {
@@ -938,10 +1059,20 @@ static void step_cb(VariableItem* item) {
 }
 
 static void conf_enter(void* ctx, uint32_t index) {
-    UNUSED(index);
     App* app = ctx;
+    if(index == 1) { // "Range MHz" row -> open the custom range editor
+        app->re_start = app->f_start / 100000;
+        app->re_end = app->f_end / 100000;
+        if(app->re_start < RE_MIN) app->re_start = RE_MIN;
+        if(app->re_end > RE_MAX) app->re_end = RE_MAX;
+        app->re_field = 0;
+        app->re_cur = 0;
+        FURI_LOG_I(TAG, "config: open range editor");
+        view_dispatcher_switch_to_view(app->vd, VIEW_RANGE);
+        return;
+    }
     FURI_LOG_I(TAG, "config: OK -> spectrum");
-    view_dispatcher_switch_to_view(app->vd, VIEW_SPEC); // OK starts the scan
+    view_dispatcher_switch_to_view(app->vd, VIEW_SPEC); // OK on any other row starts the scan
 }
 
 static void redraw_cb(void* ctx) {
@@ -1017,6 +1148,15 @@ int32_t rf_survey_app(void* p) {
     view_set_previous_callback(variable_item_list_get_view(app->conf), view_exit);
     view_dispatcher_add_view(app->vd, VIEW_CONF, variable_item_list_get_view(app->conf));
 
+    // custom range editor view (Back returns to config)
+    app->range_view = view_alloc();
+    view_allocate_model(app->range_view, ViewModelTypeLockFree, sizeof(void*));
+    view_set_context(app->range_view, app);
+    view_set_draw_callback(app->range_view, range_draw);
+    view_set_input_callback(app->range_view, range_input);
+    view_set_previous_callback(app->range_view, to_conf);
+    view_dispatcher_add_view(app->vd, VIEW_RANGE, app->range_view);
+
     // install the permissive region for the scan (RX only); restored on exit
     const FuriHalRegion* orig_region = furi_hal_region_get();
     furi_hal_region_set((FuriHalRegion*)&s_region);
@@ -1047,7 +1187,9 @@ int32_t rf_survey_app(void* p) {
 
     view_dispatcher_remove_view(app->vd, VIEW_SPEC);
     view_dispatcher_remove_view(app->vd, VIEW_CONF);
+    view_dispatcher_remove_view(app->vd, VIEW_RANGE);
     view_free(app->view);
+    view_free(app->range_view);
     variable_item_list_free(app->conf);
     view_dispatcher_free(app->vd);
     furi_record_close(RECORD_GUI);
