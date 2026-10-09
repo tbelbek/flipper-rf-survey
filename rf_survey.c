@@ -424,10 +424,10 @@ static const uint8_t* preset_regs(App* app, uint8_t p, uint8_t gain, uint8_t bwn
     return app->preset_buf;
 }
 
-// a short, light vibro tick for the locate cue (~10 ms, lighter than sequence_single_vibro)
+// a short, light vibro tick for the locate cue (~25 ms, lighter than sequence_single_vibro)
 static const NotificationSequence seq_vibro_tick = {
     &message_vibro_on,
-    &message_delay_10,
+    &message_delay_25,
     &message_vibro_off,
     NULL,
 };
