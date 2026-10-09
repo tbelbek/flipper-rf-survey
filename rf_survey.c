@@ -629,6 +629,11 @@ static int32_t sweep_worker(void* ctx) {
                     hap_last = tn;
                 }
                 haptic_pump(app, furi_get_tick());
+            } else if(app->hap_on) {
+                // spectrum was left (or haptic disabled) while a pulse was latched on -- release it.
+                // spec_exit also calls haptic_off, but this worker thread can re-arm the motor in a
+                // check-then-act race after that; releasing here guarantees it can't stay stuck on.
+                haptic_off(app);
             }
         }
         // commit this sweep as one waterfall column: max-fold the bins to WF_ROWS freq rows,
