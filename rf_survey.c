@@ -6,6 +6,8 @@
 #include <gui/view.h>
 #include <gui/elements.h>
 #include <gui/modules/variable_item_list.h>
+#include <storage/storage.h>
+#include <furi_hal_rtc.h>
 
 // CC1101 preset register tables are exported to apps; AM650 = wide OOK, good for a
 // broadband RSSI survey. (Same names the stock Spectrum Analyzer / SubGHz use.)
@@ -177,6 +179,13 @@ typedef struct {
     uint8_t wf_count;
     volatile uint8_t win_sec; // display window for connected/waterfall pages (5..60 s)
 
+    // CSV logging. The worker owns the File*; the GUI (long-OK) only flips `recording`.
+    // Stopped on any reconfig so the fixed-column CSV never mixes two ranges. The line
+    // buffer lives here (heap) -- a 5 KB stack local would blow the 3 KB worker stack.
+    volatile bool recording;
+    uint32_t rec_rows;
+    char csv_line[MAX_BINS * 5 + 32];
+
     // spectrum UI state
     uint8_t page; // 0=bars 1=connected 2=waterfall 3=numeric
     uint16_t cursor; // bars cursor column (framed); OK zooms into it
@@ -214,6 +223,66 @@ static int8_t wf_row_max(const App* app, int r) {
     return m;
 }
 
+// ---- CSV logging -----------------------------------------------------------
+
+// Open /ext/apps_data/rfsurvey/survey_<rtc>.csv and write the metadata header. The
+// columns are fixed for the file's lifetime (one per bin of the current range), so the
+// worker stops recording on any reconfig rather than appending a second header.
+static File* csv_open(App* app, Storage* storage) {
+    storage_common_mkdir(storage, APP_DATA_PATH("")); // idempotent; ignore "exists"
+    DateTime dt;
+    furi_hal_rtc_get_datetime(&dt);
+    char path[96];
+    // tick suffix makes the name unique even for two recordings within the same RTC second,
+    // so CREATE_ALWAYS can never truncate a previous file.
+    snprintf(
+        path,
+        sizeof(path),
+        APP_DATA_PATH("survey_%04u%02u%02u_%02u%02u%02u_%03lu.csv"),
+        dt.year,
+        dt.month,
+        dt.day,
+        dt.hour,
+        dt.minute,
+        dt.second,
+        (unsigned long)(furi_get_tick() % 1000));
+    File* f = storage_file_alloc(storage);
+    if(!storage_file_open(f, path, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
+        FURI_LOG_E(TAG, "csv: open failed %s", path);
+        storage_file_close(f);
+        storage_file_free(f);
+        return NULL;
+    }
+    int n = snprintf(
+        app->csv_line,
+        sizeof(app->csv_line),
+        "# RF Survey\n# start=%lu end=%lu step=%lu nbins=%u settle=%u mod=%s\n"
+        "# rtc=%04u-%02u-%02u %02u:%02u:%02u\n"
+        "# t_ms,bin0..bin%u (dBm; -128=invalid)  binfreq=start+idx*step\n",
+        (unsigned long)app->f_start,
+        (unsigned long)app->f_end,
+        (unsigned long)app->f_step,
+        app->nbins,
+        app->settle_ms,
+        mod_str(app->mod),
+        dt.year,
+        dt.month,
+        dt.day,
+        dt.hour,
+        dt.minute,
+        dt.second,
+        (unsigned)(app->nbins ? app->nbins - 1 : 0));
+    if(storage_file_write(f, app->csv_line, n) != (size_t)n) { // SD full -> no half header
+        FURI_LOG_E(TAG, "csv: header write failed");
+        storage_file_close(f);
+        storage_file_free(f);
+        return NULL;
+    }
+    app->rec_rows = 0;
+    FURI_LOG_I(TAG, "csv: recording -> %s", path);
+    return f;
+}
+
 // ---- radio sweep worker ----------------------------------------------------
 
 static int32_t sweep_worker(void* ctx) {
@@ -222,10 +291,24 @@ static int32_t sweep_worker(void* ctx) {
     furi_hal_subghz_reset();
     furi_hal_subghz_load_custom_preset(subghz_device_cc1101_preset_ook_650khz_async_regs);
 
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    File* csv = NULL; // open while recording; owned entirely by this thread
+
     while(app->running) {
         // apply a pending config change: recompute bins for the new range/step and
         // clear the buffers so stale readings from the old range don't linger
         if(app->reconfig) {
+            // a range change invalidates an open CSV's fixed columns -> stop cleanly
+            if(csv) {
+                storage_file_close(csv);
+                storage_file_free(csv);
+                csv = NULL;
+                app->recording = false;
+                FURI_LOG_I(
+                    TAG, "csv: stopped by reconfig, %lu rows", (unsigned long)app->rec_rows);
+            }
+            if(app->f_step == 0) app->f_step = 650000; // never divide by zero
+            if(app->f_end < app->f_start) app->f_end = app->f_start;
             uint32_t n = (app->f_end - app->f_start) / app->f_step + 1;
             if(n > MAX_BINS) n = MAX_BINS;
             if(n < 1) n = 1;
@@ -248,8 +331,21 @@ static int32_t sweep_worker(void* ctx) {
                 (unsigned long)app->f_step,
                 app->nbins);
         }
+        // reconcile the file handle with the GUI's recording flag (long-OK toggles it)
+        if(app->recording && !csv) {
+            csv = csv_open(app, storage);
+            if(!csv) app->recording = false; // open failed -> don't get stuck "recording"
+        } else if(!app->recording && csv) {
+            storage_file_close(csv);
+            storage_file_free(csv);
+            csv = NULL;
+            FURI_LOG_I(TAG, "csv: stopped, %lu rows", (unsigned long)app->rec_rows);
+        }
+        // snapshot the range for this sweep: a mid-sweep config change (GUI) then only
+        // takes effect next loop via reconfig, so one row is never a torn A/B mix.
+        uint32_t fs = app->f_start, st = app->f_step;
         for(uint16_t i = 0; i < app->nbins && app->running; i++) {
-            uint32_t f = app->f_start + (uint32_t)i * app->f_step;
+            uint32_t f = fs + (uint32_t)i * st;
             if(!furi_hal_subghz_is_frequency_valid(f) || !tune_rx(f)) {
                 app->rssi[i] = -128; // sentinel: band gap / invalid / un-tunable
                 continue;
@@ -277,8 +373,33 @@ static int32_t sweep_worker(void* ctx) {
         app->sweeps++;
         if((app->sweeps & 0x0F) == 0)
             FURI_LOG_D(TAG, "worker: sweep %lu", (unsigned long)app->sweeps);
+
+        // log one CSV row for this sweep: "t_ms,rssi0,..,rssiN" (one write, buffered)
+        if(csv) {
+            int cap = (int)sizeof(app->csv_line);
+            int off = snprintf(app->csv_line, cap, "%lu", (unsigned long)furi_get_tick());
+            for(uint16_t i = 0; i < app->nbins && off < cap - 8; i++)
+                off += snprintf(app->csv_line + off, cap - off, ",%d", app->rssi[i]);
+            if(off < cap - 1) app->csv_line[off++] = '\n';
+            size_t wr = storage_file_write(csv, app->csv_line, off);
+            if(wr != (size_t)off) { // SD full / failing -> stop cleanly, don't spin
+                FURI_LOG_E(TAG, "csv: short write %u/%d, stopping", (unsigned)wr, off);
+                storage_file_close(csv);
+                storage_file_free(csv);
+                csv = NULL;
+                app->recording = false;
+            } else {
+                app->rec_rows++;
+            }
+        }
     }
 
+    if(csv) { // app closing mid-record -> flush + close
+        storage_file_close(csv);
+        storage_file_free(csv);
+        FURI_LOG_I(TAG, "csv: closed on exit, %lu rows", (unsigned long)app->rec_rows);
+    }
+    furi_record_close(RECORD_STORAGE);
     FURI_LOG_I(TAG, "worker: exit, radio idle+sleep");
     furi_hal_subghz_idle();
     furi_hal_subghz_sleep();
@@ -641,6 +762,19 @@ static void spectrum_draw(Canvas* canvas, void* model) {
     elements_button_left(canvas, "Page");
     if(app->page == 0) elements_button_center(canvas, "Zoom");
     if(app->zdepth) elements_button_right(canvas, "Out");
+
+    // recording indicator (long-OK toggles): filled dot + row count, top-right.
+    // XOR on the full-bleed pages (2/3) so it reads over lit/dark cells.
+    if(app->recording) {
+        bool fb = (app->page == 2 || app->page == 3);
+        if(fb) canvas_set_color(canvas, ColorXOR);
+        char s[16];
+        snprintf(s, sizeof(s), "REC %lu", (unsigned long)app->rec_rows);
+        int w = (int)canvas_string_width(canvas, s);
+        canvas_draw_disc(canvas, SCR_W - w - 7, 4, 2);
+        canvas_draw_str(canvas, SCR_W - w - 1, 8, s);
+        if(fb) canvas_set_color(canvas, ColorBlack);
+    }
 }
 
 static bool spectrum_input(InputEvent* event, void* context) {
@@ -685,8 +819,14 @@ static bool spectrum_input(InputEvent* event, void* context) {
         spec_redraw(app);
         return true;
     }
+    if(event->key == InputKeyOk && lp) {
+        app->recording = !app->recording; // long-press toggles CSV logging (any page)
+        FURI_LOG_I(TAG, "input: rec %s", app->recording ? "start" : "stop");
+        spec_redraw(app);
+        return true;
+    }
     if(event->key == InputKeyOk && sp && app->page == 0) {
-        zoom_in(app, app->cursor); // click the framed band -> zoom in
+        zoom_in(app, app->cursor); // short-press on bars: zoom into the framed band
         spec_redraw(app);
         return true;
     }
