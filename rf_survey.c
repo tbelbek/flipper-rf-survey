@@ -432,8 +432,6 @@ static const uint8_t* preset_regs(App* app, uint8_t p, uint8_t gain, uint8_t bwn
 static uint32_t grp_freq(const App* app, uint16_t k);
 static void numeric_top4(const App* app, int tv[4], uint16_t tb[4]);
 
-#define HAP_SPAN 30 // dB above Trigger that maps to full-strength vibration
-
 // stop the locate vibro and reset the filter. Call on every exit path (worker stop, view leave,
 // capture end, haptic turned off) -- otherwise sequence_set_vibro_on holds the motor ON forever.
 static void haptic_off(App* app) {
@@ -444,8 +442,10 @@ static void haptic_off(App* app) {
 }
 
 #define HAP_PULSE   22 // fixed vibro pulse length (ms); only the GAP between pulses encodes strength
-#define HAP_GAP_MIN 500 // strongest signal -> ~0.5 s gap (fastest ticks)
+#define HAP_GAP_MIN 100 // at the ceiling (right on top of the source) -> ~0.1 s gap (rapid ticks)
 #define HAP_GAP_MAX 4000 // at the Trigger floor -> ~4 s gap (quadratic ramp between the two)
+#define HAP_CEIL    -30 // ABSOLUTE ceiling (dBm): fastest ticks here, so you can feel the source's
+// very peak (CC1101 saturates near 0 dBm; a source right against the antenna reads ~-30..-20).
 
 // Feed one FRESH RSSI reading of the selected frequency into the locate filter. Peak-hold with slow
 // decay so the rate stays steady through OOK keying gaps instead of flickering; +1 so the integer
@@ -480,7 +480,11 @@ static void haptic_pump(App* app, uint32_t now) {
     if(app->hap_on) { // end the fixed pulse, then wait a strength-dependent gap
         notification_message(app->notif, &sequence_reset_vibro);
         app->hap_on = false;
-        int32_t lvl = ((int32_t)(app->hap_level - app->trigger) * 255) / HAP_SPAN;
+        // scale from the user Trigger (floor) up to the ABSOLUTE ceiling -30 dBm, so getting right
+        // on top of a source keeps speeding up instead of pegging at trigger+30 (Trigger maxes at
+        // -45, so the span is always >= 15 dB -> no divide-by-zero).
+        int32_t span = HAP_CEIL - app->trigger;
+        int32_t lvl = ((int32_t)(app->hap_level - app->trigger) * 255) / span;
         if(lvl < 0) lvl = 0;
         if(lvl > 255) lvl = 255;
         // quadratic in "weakness" (w = 255-lvl): the gap stays near MIN across the strong range and
