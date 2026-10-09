@@ -443,26 +443,28 @@ static void haptic_off(App* app) {
     app->hap_next = 0;
 }
 
+#define HAP_PULSE   22 // fixed vibro pulse length (ms); only the GAP between pulses encodes strength
+#define HAP_GAP_MIN 70 // strongest signal -> ~70 ms gap (fast, closely-spaced ticks)
+#define HAP_GAP_MAX 520 // at the Trigger floor -> ~520 ms gap (slow, far-apart ticks)
+
 // One non-blocking locate tick, shared by the sweep and capture workers. 'raw' is the latest RSSI
-// of the frequency being homed in on; 'now' is furi_get_tick() (ms). The motor is a binary ERM so
-// "little vs lots" is a DUTY CYCLE: weak -> short pulse / long gap (faint ticks), strong -> long
-// pulse / short gap (near-continuous). OOK carriers are on/off keyed, so a plain average drifts to
-// noise; instead peak-hold with slow decay tracks the carrier through its keying gaps. floor is the
-// user Trigger (below it = silent, no buzzing on noise), range is a fixed HAP_SPAN dB so the feel is
-// the same whatever the Trigger is set to. State lives in App so the filter settles across sweeps.
+// of the frequency being homed in on; 'now' is furi_get_tick() (ms). Pure RATE cue (Geiger-counter
+// feel): every pulse is the SAME short length, only the GAP between pulses tracks strength -- strong
+// = short gap (fast ticks), weak = long gap (slow ticks). This is far more consistent than varying
+// the pulse width/duty. Below the Trigger it is fully silent (gated on the instantaneous reading).
+// The gap itself is derived from a peak-hold-with-slow-decay of the RSSI so the RATE stays steady
+// through OOK keying gaps instead of flickering; that state lives in App so it settles across sweeps.
 static void haptic_tick(App* app, int8_t raw, uint32_t now) {
     if(raw > app->hap_level) {
         app->hap_level = raw; // fast attack to a burst
     } else {
-        // slow decay (OOK-jitter cure); +1 so the integer >>3 can't stall ~7 dB short of the
-        // target and leave the motor faintly buzzing on noise after a strong signal stops.
+        // slow decay (OOK-jitter cure); +1 so the integer >>3 can't stall ~7 dB short of the target.
         int16_t d = app->hap_level - raw;
         app->hap_level -= (int16_t)((d >> 3) + (d ? 1 : 0));
     }
 
-    // gate on the INSTANTANEOUS reading, not the held level: the moment the selected freq drops
-    // below the Trigger the motor goes silent (the slow-decaying hap_level would otherwise linger
-    // above the floor and keep buzzing after the signal is already gone).
+    // gate on the INSTANTANEOUS reading: the moment the selected freq drops below the Trigger the
+    // motor goes silent -- no lingering buzz from the slow-decaying held level.
     if(raw < app->trigger) {
         if(app->hap_on) {
             notification_message(app->notif, &sequence_reset_vibro);
@@ -472,19 +474,18 @@ static void haptic_tick(App* app, int8_t raw, uint32_t now) {
     }
     if((int32_t)(now - app->hap_next) < 0) return; // wrap-safe: not time to toggle yet
 
-    int32_t lvl = ((int32_t)(app->hap_level - app->trigger) * 255) / HAP_SPAN;
-    if(lvl < 0) lvl = 0;
-    if(lvl > 255) lvl = 255;
-    uint16_t on_ms = (uint16_t)(20 + lvl * 40 / 255); //  20..60  (>=20ms so an ERM is felt)
-    uint16_t off_ms = (uint16_t)(280 - lvl * 260 / 255); // 280..20
-    if(app->hap_on) {
+    if(app->hap_on) { // end the fixed pulse, then wait a strength-dependent gap
         notification_message(app->notif, &sequence_reset_vibro);
         app->hap_on = false;
-        app->hap_next = now + off_ms;
-    } else {
+        int32_t lvl = ((int32_t)(app->hap_level - app->trigger) * 255) / HAP_SPAN;
+        if(lvl < 0) lvl = 0;
+        if(lvl > 255) lvl = 255;
+        uint16_t gap = (uint16_t)(HAP_GAP_MAX - lvl * (HAP_GAP_MAX - HAP_GAP_MIN) / 255);
+        app->hap_next = now + gap;
+    } else { // start a fixed-length pulse
         notification_message(app->notif, &sequence_set_vibro_on);
         app->hap_on = true;
-        app->hap_next = now + on_ms;
+        app->hap_next = now + HAP_PULSE;
     }
 }
 
