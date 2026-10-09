@@ -1,5 +1,6 @@
 #include <furi.h>
 #include <furi_hal_subghz.h>
+#include <furi_hal_region.h>
 #include <gui/gui.h>
 #include <gui/view_dispatcher.h>
 #include <gui/view.h>
@@ -9,6 +10,44 @@
 // CC1101 preset register tables are exported to apps; AM650 = wide OOK, good for a
 // broadband RSSI survey. (Same names the stock Spectrum Analyzer / SubGHz use.)
 extern const uint8_t subghz_device_cc1101_preset_ook_650khz_async_regs[];
+
+// A permissive region covering the three CC1101 bands, installed for the app's lifetime
+// (restored on exit). Receiving is legal everywhere; without this, out-of-"default-range"
+// frequencies (e.g. cellular 816/836) fail to tune cleanly -> the radio stalls on a 10 ms
+// settle timeout per bin (whole-sweep freeze) and can furi_crash. We never transmit.
+// Layout matches FuriHalRegion (flexible array) with a fixed 3-band tail.
+static struct {
+    char country_code[4];
+    uint16_t bands_count;
+    FuriHalRegionBand bands[3];
+} s_region = {
+    .country_code = {'W', 'W', 0, 0},
+    .bands_count = 3,
+    .bands =
+        {
+            {299999755, 348000335, 20, 100},
+            {386999938, 464000000, 20, 100},
+            {778999847, 928000000, 20, 100},
+        },
+};
+
+// set the CC1101 to freq and the matching RF path WITHOUT furi_hal_subghz_set_frequency_and_path,
+// which furi_crash()es if the quantised real frequency lands in a band gap. Returns false
+// (caller marks the bin invalid) instead of crashing.
+static bool tune_rx(uint32_t f) {
+    furi_hal_subghz_idle();
+    uint32_t real = furi_hal_subghz_set_frequency(f);
+    if(real >= 299999755 && real <= 348000335)
+        furi_hal_subghz_set_path(FuriHalSubGhzPath315);
+    else if(real >= 386999938 && real <= 464000000)
+        furi_hal_subghz_set_path(FuriHalSubGhzPath433);
+    else if(real >= 778999847 && real <= 928000000)
+        furi_hal_subghz_set_path(FuriHalSubGhzPath868);
+    else
+        return false; // out of band after quantisation -> skip, never crash
+    furi_hal_subghz_rx();
+    return true;
+}
 
 // Verbose debug logging: every lifecycle step, config change, worker transition and
 // (coming) logging/capture op is traced so a crash on the remote device can be pinned
@@ -23,6 +62,8 @@ extern const uint8_t subghz_device_cc1101_preset_ook_650khz_async_regs[];
 #define MAX_H      28 // tallest bar
 #define BODY_Y0    22 // top of the page body
 #define HIST_ROWS  28 // waterfall history depth (1px per sweep)
+#define NBARS      32 // thick grouped bars (4px pitch) -> easy cursor stepping
+#define BAR_PITCH  (SCR_W / NBARS)
 #define RSSI_FLOOR -100.0f
 #define RSSI_CEIL  -40.0f
 
@@ -199,13 +240,10 @@ static int32_t sweep_worker(void* ctx) {
         }
         for(uint16_t i = 0; i < app->nbins && app->running; i++) {
             uint32_t f = app->f_start + (uint32_t)i * app->f_step;
-            if(!furi_hal_subghz_is_frequency_valid(f)) {
-                app->rssi[i] = -128; // sentinel: band gap / invalid
+            if(!furi_hal_subghz_is_frequency_valid(f) || !tune_rx(f)) {
+                app->rssi[i] = -128; // sentinel: band gap / invalid / un-tunable
                 continue;
             }
-            furi_hal_subghz_idle();
-            furi_hal_subghz_set_frequency_and_path(f); // picks the matching RF path per band
-            furi_hal_subghz_rx();
             furi_delay_ms(app->settle_ms);
             float rf = furi_hal_subghz_get_rssi();
             int8_t r = (rf < -127.0f) ? (int8_t)-127 : (int8_t)rf; // keep -128 as the sentinel
@@ -234,24 +272,64 @@ static int32_t sweep_worker(void* ctx) {
 
 // ---- bars view -------------------------------------------------------------
 
-static int bar_h(int dbm) {
-    if(dbm < (int)RSSI_FLOOR) dbm = (int)RSSI_FLOOR;
-    if(dbm > (int)RSSI_CEIL) dbm = (int)RSSI_CEIL;
-    return (dbm - (int)RSSI_FLOOR) * MAX_H / ((int)RSSI_CEIL - (int)RSSI_FLOOR);
+// bar height for a dBm against a dynamic [floor,ceil] window (autoscale)
+static int bar_h(int dbm, int floor, int ceil) {
+    if(ceil <= floor) ceil = floor + 1;
+    if(dbm < floor) dbm = floor;
+    if(dbm > ceil) dbm = ceil;
+    return (dbm - floor) * MAX_H / (ceil - floor);
 }
 
-static uint32_t col_freq(const App* app, uint16_t px) {
-    uint32_t bin = (uint32_t)px * app->nbins / SCR_W;
+// autoscale the vertical window to the data in view, so the noise floor shows texture
+// and weak signals aren't clamped flat. min 15 dB window.
+static void autoscale(const App* app, int* floor, int* ceil) {
+    int lo = 127, hi = -128;
+    for(uint16_t i = 0; i < app->nbins; i++) {
+        int8_t v = app->rssi[i];
+        if(v == -128) continue; // sentinel / band gap
+        if(v < lo) lo = v;
+        if(v > hi) hi = v;
+    }
+    if(hi < lo) {
+        lo = (int)RSSI_FLOOR;
+        hi = (int)RSSI_CEIL;
+    }
+    if(hi - lo < 15) {
+        hi = lo + 15;
+    }
+    *floor = lo;
+    *ceil = hi;
+}
+
+// center frequency of grouped bar k (0..NBARS-1)
+static uint32_t grp_freq(const App* app, uint16_t k) {
+    uint32_t bin = ((uint32_t)k * 2 + 1) * app->nbins / (NBARS * 2);
+    if(bin >= app->nbins) bin = app->nbins ? app->nbins - 1 : 0;
     return app->f_start + bin * app->f_step;
+}
+
+// max rssi/peak over the bins of grouped bar k
+static void grp_max(const App* app, uint16_t k, int8_t* cur, int8_t* pk) {
+    uint32_t b0 = (uint32_t)k * app->nbins / NBARS;
+    uint32_t b1 = (uint32_t)(k + 1) * app->nbins / NBARS;
+    if(b1 <= b0) b1 = b0 + 1;
+    if(b1 > app->nbins) b1 = app->nbins;
+    int8_t c = -128, p = -128;
+    for(uint32_t b = b0; b < b1; b++) {
+        if(app->rssi[b] > c) c = app->rssi[b];
+        if(app->peak[b] > p) p = app->peak[b];
+    }
+    *cur = c;
+    *pk = p;
 }
 
 static void spec_redraw(App* app) {
     with_view_model(app->view, void** m, { UNUSED(m); }, true);
 }
 
-static void zoom_in(App* app, uint16_t px) {
+static void zoom_in(App* app, uint16_t k) {
     if(app->zdepth >= COUNT_OF(app->zstack)) return;
-    uint32_t fc = col_freq(app, px);
+    uint32_t fc = grp_freq(app, k); // center of the framed grouped bar
     uint32_t span = app->f_end - app->f_start;
     uint32_t ns_span = span / 5;
     if(ns_span < 2000000) ns_span = 2000000; // don't zoom below ~2 MHz
@@ -271,7 +349,7 @@ static void zoom_in(App* app, uint16_t px) {
     uint32_t st = app->f_step / 4;
     if(st < 10000) st = 10000; // finer step, min 10 kHz
     app->f_step = st;
-    app->cursor = SCR_W / 2;
+    app->cursor = NBARS / 2;
     app->reconfig = true;
     FURI_LOG_I(
         TAG,
@@ -288,7 +366,7 @@ static void zoom_out(App* app) {
     app->f_start = app->zstack[app->zdepth].s;
     app->f_end = app->zstack[app->zdepth].e;
     app->f_step = app->zstack[app->zdepth].st;
-    app->cursor = SCR_W / 2;
+    app->cursor = NBARS / 2;
     app->reconfig = true;
     FURI_LOG_I(TAG, "zoom out depth=%u", app->zdepth);
 }
@@ -319,71 +397,90 @@ static void draw_info(Canvas* canvas, uint32_t f, int dbm) {
     canvas_draw_str(canvas, 2, 18, s);
 }
 
-static void draw_bars(Canvas* canvas, App* app) {
-    for(int px = 0; px < SCR_W; px++) {
+static void draw_bars(Canvas* canvas, App* app, int floor, int ceil) {
+    for(uint16_t k = 0; k < NBARS; k++) {
         int8_t cur, pk;
-        col_max(app, px, &cur, &pk);
-        int h = bar_h(cur);
-        if(h > 0) canvas_draw_line(canvas, px, BASE_Y, px, BASE_Y - h);
-        int ph = bar_h(pk);
-        if(ph > 0) canvas_draw_dot(canvas, px, BASE_Y - ph);
+        grp_max(app, k, &cur, &pk);
+        int x = k * BAR_PITCH;
+        int h = bar_h(cur, floor, ceil);
+        if(h > 0) canvas_draw_box(canvas, x, BASE_Y - h, BAR_PITCH - 1, h);
+        int ph = bar_h(pk, floor, ceil);
+        if(ph > 0) canvas_draw_line(canvas, x, BASE_Y - ph, x + BAR_PITCH - 2, BASE_Y - ph);
     }
     canvas_draw_line(canvas, 0, BASE_Y + 1, SCR_W - 1, BASE_Y + 1);
-    // cursor frame (the band you'd zoom into)
-    int cx = app->cursor;
+    // wide cursor frame around the selected grouped bar (the band you'd zoom into)
+    int cx = (int)app->cursor * BAR_PITCH;
     if(cx < 1) cx = 1;
-    if(cx > SCR_W - 2) cx = SCR_W - 2;
-    canvas_draw_frame(canvas, cx - 1, BODY_Y0 - 2, 3, BASE_Y - BODY_Y0 + 3);
+    canvas_draw_frame(canvas, cx - 1, BODY_Y0 - 2, BAR_PITCH + 1, BASE_Y - BODY_Y0 + 3);
 }
 
-static void draw_waterfall(Canvas* canvas, App* app) {
-    // newest row at the top; a dot where the column was above the activity threshold
+static void draw_waterfall(Canvas* canvas, App* app, int floor, int ceil) {
+    int thr = floor + (ceil - floor) * 3 / 10; // activity threshold within the dynamic window
     for(uint8_t r = 0; r < app->hist_count && r < HIST_ROWS; r++) {
         uint8_t idx = (uint8_t)((app->hist_head + HIST_ROWS - 1 - r) % HIST_ROWS);
         int y = BODY_Y0 + r;
         if(y > BASE_Y) break;
         const int8_t* row = app->hist[idx];
-        for(int px = 0; px < SCR_W; px++) {
-            if(row[px] > (int8_t)(RSSI_FLOOR + 12)) canvas_draw_dot(canvas, px, y);
-        }
+        for(int px = 0; px < SCR_W; px++)
+            if(row[px] > thr) canvas_draw_dot(canvas, px, y);
     }
 }
 
+static void draw_card(Canvas* canvas, int x0, int y0, int x1, int y1, uint32_t f, int dbm) {
+    if(x1 - x0 < 10 || y1 - y0 < 9) return; // too small to render
+    canvas_draw_frame(canvas, x0, y0, x1 - x0 - 1, y1 - y0 - 1);
+    char s[20];
+    snprintf(
+        s, sizeof(s), "%lu.%lu", (unsigned long)(f / 1000000), (unsigned long)((f / 100000) % 10));
+    canvas_draw_str(canvas, x0 + 3, y0 + 9, s);
+    if(y1 - y0 >= 17) {
+        const FreqBand* b = band_lookup(f);
+        snprintf(s, sizeof(s), "%d %s", dbm, b ? b->name : "");
+        canvas_draw_str(canvas, x0 + 3, y0 + 17, s);
+    }
+}
+
+// 2x2 "treemap": each card's area is proportional to its signal strength, so a dominant
+// signal gets a bigger card and four equal signals split into equal quarters.
 static void draw_numeric(Canvas* canvas, App* app) {
-    // top 4 columns by current level, shown as "freq: dBm ~band"
-    int top_v[4] = {-200, -200, -200, -200};
-    uint16_t top_px[4] = {0, 0, 0, 0};
-    for(int px = 0; px < SCR_W; px++) {
+    int tv[4] = {-200, -200, -200, -200};
+    uint16_t tk[4] = {0};
+    for(uint16_t k = 0; k < NBARS; k++) {
         int8_t cur, pk;
-        col_max(app, px, &cur, &pk);
+        grp_max(app, k, &cur, &pk);
         int v = cur;
-        for(int k = 0; k < 4; k++) {
-            if(v > top_v[k]) {
-                for(int j = 3; j > k; j--) {
-                    top_v[j] = top_v[j - 1];
-                    top_px[j] = top_px[j - 1];
+        for(int m = 0; m < 4; m++) {
+            if(v > tv[m]) {
+                for(int j = 3; j > m; j--) {
+                    tv[j] = tv[j - 1];
+                    tk[j] = tk[j - 1];
                 }
-                top_v[k] = v;
-                top_px[k] = px;
+                tv[m] = v;
+                tk[m] = k;
                 break;
             }
         }
     }
-    for(int k = 0; k < 4; k++) {
-        if(top_v[k] <= -128) continue;
-        uint32_t f = col_freq(app, top_px[k]);
-        const FreqBand* b = band_lookup(f);
-        char s[40];
-        snprintf(
-            s,
-            sizeof(s),
-            "%lu.%lu %d %s",
-            (unsigned long)(f / 1000000),
-            (unsigned long)((f / 100000) % 10),
-            top_v[k],
-            b ? b->name : "");
-        canvas_draw_str(canvas, 2, BODY_Y0 + 8 + k * 8, s);
+    int w[4], tot = 0;
+    for(int m = 0; m < 4; m++) {
+        w[m] = (tv[m] <= -128) ? 0 : (tv[m] - (int)RSSI_FLOOR + 1);
+        if(w[m] < 0) w[m] = 0;
+        tot += w[m];
     }
+    if(tot <= 0) {
+        canvas_draw_str(canvas, 28, BODY_Y0 + 16, "no signals");
+        return;
+    }
+    int X0 = 0, X1 = SCR_W, Y0 = BODY_Y0, Y1 = BASE_Y + 2;
+    int xs = X0 + (X1 - X0) * (w[0] + w[2]) / tot; // vertical split by column weight
+    if(xs < X0 + 36) xs = X0 + 36;
+    if(xs > X1 - 36) xs = X1 - 36;
+    int ysl = Y0 + ((w[0] + w[2]) ? (Y1 - Y0) * w[0] / (w[0] + w[2]) : (Y1 - Y0));
+    int ysr = Y0 + ((w[1] + w[3]) ? (Y1 - Y0) * w[1] / (w[1] + w[3]) : (Y1 - Y0));
+    if(w[0]) draw_card(canvas, X0, Y0, xs, ysl, grp_freq(app, tk[0]), tv[0]);
+    if(w[2]) draw_card(canvas, X0, ysl, xs, Y1, grp_freq(app, tk[2]), tv[2]);
+    if(w[1]) draw_card(canvas, xs, Y0, X1, ysr, grp_freq(app, tk[1]), tv[1]);
+    if(w[3]) draw_card(canvas, xs, ysr, X1, Y1, grp_freq(app, tk[3]), tv[3]);
 }
 
 static void spectrum_draw(Canvas* canvas, void* model) {
@@ -393,23 +490,24 @@ static void spectrum_draw(Canvas* canvas, void* model) {
     canvas_clear(canvas);
     canvas_set_font(canvas, FontSecondary);
 
-    // header: range + page + sweeps
+    // header: just the range + the likely band name (short) for the range center
+    uint32_t fc = app->f_start / 2 + app->f_end / 2;
+    const FreqBand* hb = band_lookup(fc);
     char hdr[40];
     snprintf(
         hdr,
         sizeof(hdr),
-        "%lu-%lu p%u sw%lu",
+        "%lu-%lu %s",
         (unsigned long)(app->f_start / 1000000),
         (unsigned long)(app->f_end / 1000000),
-        (unsigned)(app->page + 1),
-        (unsigned long)app->sweeps);
+        hb ? hb->name : "");
     canvas_draw_str(canvas, 2, 8, hdr);
 
     // info line: cursor readout on bars, global peak otherwise
     if(app->page == 0) {
         int8_t cur, pk;
-        col_max(app, app->cursor, &cur, &pk);
-        draw_info(canvas, col_freq(app, app->cursor), cur);
+        grp_max(app, app->cursor, &cur, &pk);
+        draw_info(canvas, grp_freq(app, app->cursor), cur);
     } else {
         int pmax = -200;
         uint16_t pidx = 0;
@@ -422,10 +520,12 @@ static void spectrum_draw(Canvas* canvas, void* model) {
         draw_info(canvas, app->f_start + (uint32_t)pidx * app->f_step, pmax);
     }
 
+    int floor, ceil;
+    autoscale(app, &floor, &ceil);
     if(app->page == 0)
-        draw_bars(canvas, app);
+        draw_bars(canvas, app, floor, ceil);
     else if(app->page == 1)
-        draw_waterfall(canvas, app);
+        draw_waterfall(canvas, app, floor, ceil);
     else
         draw_numeric(canvas, app);
 
@@ -459,7 +559,7 @@ static bool spectrum_input(InputEvent* event, void* context) {
         return true;
     }
     if(event->key == InputKeyRight && (sp || lp)) {
-        if(sp && app->page == 0 && app->cursor < SCR_W - 1)
+        if(sp && app->page == 0 && app->cursor < NBARS - 1)
             app->cursor++;
         else
             app->page = (uint8_t)((app->page + 1) % 3); // edge / long -> next page
@@ -562,7 +662,7 @@ int32_t rf_survey_app(void* p) {
     app->f_step = 650000;
     app->settle_ms = 3;
     app->mod = ModFM; // matches the default "Full high" band preset
-    app->cursor = SCR_W / 2;
+    app->cursor = NBARS / 2;
     // defensive against bad config (future editable ranges): never div-by-zero,
     // never an inverted range, always 1..MAX_BINS bins, and keep f_end consistent
     // with the bins actually scanned so the axis labels can't lie.
@@ -609,6 +709,11 @@ int32_t rf_survey_app(void* p) {
     view_set_previous_callback(variable_item_list_get_view(app->conf), view_exit);
     view_dispatcher_add_view(app->vd, VIEW_CONF, variable_item_list_get_view(app->conf));
 
+    // install the permissive region for the scan (RX only); restored on exit
+    const FuriHalRegion* orig_region = furi_hal_region_get();
+    furi_hal_region_set((FuriHalRegion*)&s_region);
+    FURI_LOG_I(TAG, "app: region set permissive (was %s)", furi_hal_region_get_name());
+
     app->running = true;
     // 3 KB stack: the sweep worker calls into the subghz HAL (SPI); past apps in this
     // family hit an MPU/stack fault from underestimating, so leave headroom.
@@ -630,6 +735,7 @@ int32_t rf_survey_app(void* p) {
     app->running = false;
     furi_thread_join(app->worker);
     furi_thread_free(app->worker);
+    furi_hal_region_set((FuriHalRegion*)orig_region); // restore the user's region
 
     view_dispatcher_remove_view(app->vd, VIEW_SPEC);
     view_dispatcher_remove_view(app->vd, VIEW_CONF);
