@@ -483,7 +483,10 @@ static void haptic_pump(App* app, uint32_t now) {
         int32_t lvl = ((int32_t)(app->hap_level - app->trigger) * 255) / HAP_SPAN;
         if(lvl < 0) lvl = 0;
         if(lvl > 255) lvl = 255;
-        uint16_t gap = (uint16_t)(HAP_GAP_MAX - lvl * (HAP_GAP_MAX - HAP_GAP_MIN) / 255);
+        // quadratic in "weakness" (w = 255-lvl): the gap stays near MIN across the strong range and
+        // shoots up as a square once the signal weakens -> sharper "getting warmer" as you close in.
+        int32_t w = 255 - lvl;
+        uint16_t gap = (uint16_t)(HAP_GAP_MIN + (HAP_GAP_MAX - HAP_GAP_MIN) * w * w / (255 * 255));
         app->hap_next = now + gap;
     } else { // start a fixed-length pulse
         notification_message(app->notif, &sequence_set_vibro_on);
