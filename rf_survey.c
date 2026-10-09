@@ -9,6 +9,7 @@
 #include <storage/storage.h>
 #include <furi_hal_rtc.h>
 #include <notification/notification_messages.h>
+#include <flipper_format/flipper_format.h>
 
 // CC1101 preset register tables exported to apps. These set the RX filter bandwidth; the
 // survey preset is user-selectable in config (same four names the stock Spectrum Analyzer /
@@ -21,14 +22,19 @@ extern const uint8_t subghz_device_cc1101_preset_2fsk_dev47_6khz_async_regs[];
 typedef struct {
     const char* name;
     const uint8_t* regs;
+    const char* sub; // stock Preset name written into a .sub so SubGHz can replay it
 } SurveyPreset;
 
 // available in both OFW (87.1) and Unleashed (88.9) SDKs
 static const SurveyPreset PRESETS[] = {
-    {"AM650", subghz_device_cc1101_preset_ook_650khz_async_regs},
-    {"AM270", subghz_device_cc1101_preset_ook_270khz_async_regs},
-    {"FM238", subghz_device_cc1101_preset_2fsk_dev2_38khz_async_regs},
-    {"FM476", subghz_device_cc1101_preset_2fsk_dev47_6khz_async_regs},
+    {"AM650", subghz_device_cc1101_preset_ook_650khz_async_regs, "FuriHalSubGhzPresetOok650Async"},
+    {"AM270", subghz_device_cc1101_preset_ook_270khz_async_regs, "FuriHalSubGhzPresetOok270Async"},
+    {"FM238",
+     subghz_device_cc1101_preset_2fsk_dev2_38khz_async_regs,
+     "FuriHalSubGhzPreset2FSKDev238Async"},
+    {"FM476",
+     subghz_device_cc1101_preset_2fsk_dev47_6khz_async_regs,
+     "FuriHalSubGhzPreset2FSKDev476Async"},
 };
 #define PRESET_N COUNT_OF(PRESETS)
 
@@ -79,6 +85,7 @@ static bool tune_rx(uint32_t f) {
 #define VIEW_SPEC  0
 #define VIEW_CONF  1
 #define VIEW_RANGE 2 // custom start/end frequency editor
+#define VIEW_CAP   3 // .sub capture screen
 #define SCR_W      128
 #define RE_MIN     3000 // 300.0 MHz in 100 kHz units (the CC1101 low-band floor)
 #define RE_MAX     9280 // 928.0 MHz
@@ -255,6 +262,18 @@ typedef struct {
     uint32_t re_start, re_end;
     uint8_t re_field; // 0 = editing Start, 1 = editing End
     uint8_t re_cur; // active digit 0..3 (hundreds, tens, ones, tenths)
+
+    // .sub capture (VIEW_CAP): a dedicated thread owns the file+stream; the ISR only feeds
+    // the stream; the GUI flips `capturing`. The survey worker is stopped while capturing so
+    // there is never two owners of the one radio.
+    View* cap_view;
+    FuriThread* cap_worker;
+    FuriStreamBuffer* cap_stream; // ISR -> capture thread (int32 signed durations)
+    uint32_t cap_freq; // locked capture frequency (Hz)
+    uint8_t cap_preset; // preset index for capture (user can toggle OOK/FSK)
+    volatile bool capturing;
+    volatile uint32_t cap_samples; // durations written
+    volatile uint32_t cap_overflow; // ISR drops (stream full) -> capture may be corrupt
     FuriTimer* redraw;
 } App;
 
@@ -1012,6 +1031,32 @@ static bool spectrum_input(InputEvent* event, void* context) {
         spec_redraw(app);
         return true;
     }
+    if(event->key == InputKeyOk && sp && app->page == 3) {
+        // numeric page: lock the strongest bin and open the .sub capture screen. Stop the
+        // survey worker first (from this input thread, never the draw cb) so the one radio
+        // has a single owner.
+        int pmax = -200;
+        uint16_t pidx = 0;
+        for(uint16_t i = 0; i < app->nbins; i++)
+            if(app->rssi[i] > pmax) {
+                pmax = app->rssi[i];
+                pidx = i;
+            }
+        if(pmax <= -128) return true; // nothing to capture
+        app->recording = false; // the survey worker will close any open CSV as it stops
+        app->running = false;
+        furi_thread_join(app->worker);
+        furi_thread_free(app->worker);
+        app->worker = NULL;
+        app->cap_freq = app->f_start + (uint32_t)pidx * app->f_step;
+        app->cap_preset = app->preset_idx;
+        app->capturing = false;
+        app->cap_samples = 0;
+        app->cap_overflow = 0;
+        FURI_LOG_I(TAG, "capture: lock %lu Hz", (unsigned long)app->cap_freq);
+        view_dispatcher_switch_to_view(app->vd, VIEW_CAP);
+        return true;
+    }
     return true;
 }
 
@@ -1136,6 +1181,209 @@ static bool range_input(InputEvent* e, void* ctx) {
     return true;
 }
 
+// ---- .sub capture (VIEW_CAP) -----------------------------------------------
+// Re-implements the stock RAW recorder: start_async_rx streams (level,duration) edges from
+// an ISR into a stream buffer; a capture thread transition-filters them (drop <50 us noise
+// and >=1 s gaps -- the latter also keeps the signed int32 packing from overflowing) and
+// writes RAW_Data rows to a .sub the stock SubGHz app can replay. The survey worker is fully
+// stopped first so only one owner touches the radio.
+
+#define CAP_STREAM 4096 // int32 slots ISR -> thread (sized for a burst; overflow is counted)
+#define CAP_MAXSPL 60000 // auto-stop after this many durations (bounds the file)
+
+// ISR context: pack the edge and push it; never block, never allocate, never touch the file.
+static void capture_isr_cb(bool level, uint32_t duration, void* ctx) {
+    App* app = ctx;
+    FuriStreamBuffer* sb = app->cap_stream;
+    if(!sb) return;
+    if(duration < 50 || duration >= 1000000) return; // noise / huge gap -> drop (and no overflow)
+    int32_t d = level ? (int32_t)duration : -(int32_t)duration;
+    if(furi_stream_buffer_send(sb, &d, sizeof(d), 0) != sizeof(d)) app->cap_overflow++;
+}
+
+static int32_t capture_worker(void* ctx) {
+    App* app = ctx;
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    const SurveyPreset* ps = &PRESETS[app->cap_preset < PRESET_N ? app->cap_preset : 0];
+
+    storage_common_mkdir(storage, "/ext/subghz");
+    DateTime dt;
+    furi_hal_rtc_get_datetime(&dt);
+    char path[96];
+    snprintf(
+        path,
+        sizeof(path),
+        "/ext/subghz/rfsurvey_%lu_%02u%02u%02u.sub",
+        (unsigned long)(app->cap_freq / 1000),
+        dt.hour,
+        dt.minute,
+        dt.second);
+
+    FlipperFormat* ff = flipper_format_file_alloc(storage);
+    int32_t* buf = malloc(sizeof(int32_t) * 512);
+    app->cap_stream = furi_stream_buffer_alloc(sizeof(int32_t) * CAP_STREAM, sizeof(int32_t));
+    bool ok = buf && app->cap_stream && flipper_format_file_open_always(ff, path);
+    if(ok) {
+        uint32_t ver = 1, freq = app->cap_freq;
+        ok = flipper_format_write_header_cstr(ff, "Flipper SubGhz RAW File", ver) &&
+             flipper_format_write_uint32(ff, "Frequency", &freq, 1) &&
+             flipper_format_write_string_cstr(ff, "Preset", ps->sub) &&
+             flipper_format_write_string_cstr(ff, "Protocol", "RAW");
+    }
+    if(!ok) {
+        FURI_LOG_E(TAG, "cap: open/header failed %s", path);
+        app->capturing = false;
+    } else {
+        FURI_LOG_I(
+            TAG, "cap: recording %lu Hz %s -> %s", (unsigned long)app->cap_freq, ps->name, path);
+        furi_hal_subghz_reset();
+        furi_hal_subghz_load_custom_preset(ps->regs);
+        furi_hal_subghz_idle();
+        furi_hal_subghz_set_frequency(app->cap_freq);
+        if(app->cap_freq >= 299999755 && app->cap_freq <= 348000335)
+            furi_hal_subghz_set_path(FuriHalSubGhzPath315);
+        else if(app->cap_freq >= 386999938 && app->cap_freq <= 464000000)
+            furi_hal_subghz_set_path(FuriHalSubGhzPath433);
+        else
+            furi_hal_subghz_set_path(FuriHalSubGhzPath868);
+        furi_hal_subghz_start_async_rx(capture_isr_cb, app);
+
+        int ind = 0;
+        bool werr = false;
+        while(app->capturing && !werr && app->cap_samples < CAP_MAXSPL) {
+            int32_t d;
+            if(furi_stream_buffer_receive(app->cap_stream, &d, sizeof(d), 20) == sizeof(d)) {
+                buf[ind++] = d;
+                app->cap_samples++;
+                if(ind == 512) {
+                    werr = !flipper_format_write_int32(ff, "RAW_Data", buf, 512);
+                    ind = 0;
+                }
+            }
+        }
+        // teardown order is non-negotiable: stop the ISR FIRST so no callback can fire into
+        // the stream after we free it; then drain the tail, flush, close, free.
+        furi_hal_subghz_stop_async_rx();
+        int32_t d;
+        while(furi_stream_buffer_receive(app->cap_stream, &d, sizeof(d), 0) == sizeof(d) &&
+              ind < 512) {
+            buf[ind++] = d;
+            app->cap_samples++;
+        }
+        if(ind > 0) flipper_format_write_int32(ff, "RAW_Data", buf, (uint16_t)ind);
+        furi_hal_subghz_idle();
+        furi_hal_subghz_sleep();
+        FURI_LOG_I(
+            TAG,
+            "cap: stop, %lu samples, %lu overflow",
+            (unsigned long)app->cap_samples,
+            (unsigned long)app->cap_overflow);
+    }
+
+    // stop_async_rx already ran in the success path (before any free); if the file never
+    // opened, nothing was started, so there is nothing to stop here. Free in the safe order.
+    if(ff) flipper_format_free(ff);
+    if(buf) free(buf);
+    if(app->cap_stream) {
+        furi_stream_buffer_free(app->cap_stream);
+        app->cap_stream = NULL;
+    }
+    furi_record_close(RECORD_STORAGE);
+    app->capturing = false;
+    return 0;
+}
+
+static void capture_draw(Canvas* canvas, void* model) {
+    UNUSED(model);
+    App* app = g_app;
+    if(!app) return;
+    canvas_clear(canvas);
+    const SurveyPreset* ps = &PRESETS[app->cap_preset < PRESET_N ? app->cap_preset : 0];
+
+    canvas_set_font(canvas, FontSecondary);
+    canvas_draw_str(canvas, 2, 9, app->capturing ? "Capturing .sub" : "Capture .sub");
+    canvas_draw_str(canvas, 108, 9, "MHz");
+
+    canvas_draw_box(canvas, 2, 12, 124, 22);
+    canvas_set_color(canvas, ColorWhite);
+    canvas_set_font(canvas, FontBigNumbers);
+    char big[12];
+    snprintf(
+        big,
+        sizeof(big),
+        "%lu.%03lu",
+        (unsigned long)(app->cap_freq / 1000000),
+        (unsigned long)((app->cap_freq / 1000) % 1000));
+    canvas_draw_str(canvas, 6, 30, big);
+    canvas_set_color(canvas, ColorBlack);
+
+    canvas_set_font(canvas, FontSecondary);
+    char line[40];
+    snprintf(line, sizeof(line), "%s  %lu spl", ps->name, (unsigned long)app->cap_samples);
+    canvas_draw_str(canvas, 2, 45, line);
+    if(app->cap_overflow) {
+        snprintf(line, sizeof(line), "overflow %lu!", (unsigned long)app->cap_overflow);
+        canvas_draw_str(canvas, 2, 54, line);
+    }
+
+    if(app->capturing) {
+        elements_button_center(canvas, "Stop");
+    } else {
+        elements_button_left(canvas, "Mod");
+        elements_button_center(canvas, "Rec");
+        elements_button_right(canvas, "Mod");
+    }
+}
+
+static void capture_start(App* app) {
+    if(app->capturing) return;
+    app->capturing = true;
+    app->cap_samples = 0;
+    app->cap_overflow = 0;
+    app->cap_worker = furi_thread_alloc_ex("rfsurvey_cap", 3072, capture_worker, app);
+    furi_thread_start(app->cap_worker);
+}
+
+static void capture_stop(App* app) {
+    if(!app->cap_worker) return;
+    app->capturing = false;
+    furi_thread_join(app->cap_worker);
+    furi_thread_free(app->cap_worker);
+    app->cap_worker = NULL;
+}
+
+static bool capture_input(InputEvent* e, void* ctx) {
+    UNUSED(ctx);
+    App* app = g_app;
+    if(!app) return false;
+    if(e->type != InputTypeShort) return true;
+
+    if(e->key == InputKeyBack) {
+        capture_stop(app);
+        // restart a fresh survey worker (re-inits the radio exactly like first boot)
+        app->running = true;
+        app->reconfig = true;
+        app->worker = furi_thread_alloc_ex("rfsurvey_sweep", 3072, sweep_worker, app);
+        furi_thread_start(app->worker);
+        view_dispatcher_switch_to_view(app->vd, VIEW_SPEC);
+        return true;
+    }
+    if(e->key == InputKeyOk) {
+        if(app->capturing)
+            capture_stop(app);
+        else
+            capture_start(app);
+    } else if((e->key == InputKeyLeft || e->key == InputKeyRight) && !app->capturing) {
+        // toggle the capture modulation (OOK vs 2FSK) -- the user must match the signal
+        if(e->key == InputKeyRight)
+            app->cap_preset = (uint8_t)((app->cap_preset + 1) % PRESET_N);
+        else
+            app->cap_preset = (uint8_t)((app->cap_preset + PRESET_N - 1) % PRESET_N);
+    }
+    with_view_model(app->cap_view, void** m, { UNUSED(m); }, true);
+    return true;
+}
+
 // ---- config screen ---------------------------------------------------------
 
 static void band_cb(VariableItem* item) {
@@ -1225,8 +1473,10 @@ static void conf_enter(void* ctx, uint32_t index) {
 
 static void redraw_cb(void* ctx) {
     App* app = ctx;
-    // commit the (empty) model to trigger a redraw from the current buffers
+    // commit the (empty) models to trigger a redraw; only the active view actually draws, so
+    // committing both the spectrum and the capture view is cheap and keeps whichever is up live
     with_view_model(app->view, void** m, { UNUSED(m); }, true);
+    if(app->cap_view) with_view_model(app->cap_view, void** m, { UNUSED(m); }, true);
 }
 
 // ---- entry -----------------------------------------------------------------
@@ -1318,6 +1568,14 @@ int32_t rf_survey_app(void* p) {
     view_set_previous_callback(app->range_view, to_conf);
     view_dispatcher_add_view(app->vd, VIEW_RANGE, app->range_view);
 
+    // .sub capture view (Back is handled in its input callback: stop + restart the survey)
+    app->cap_view = view_alloc();
+    view_allocate_model(app->cap_view, ViewModelTypeLockFree, sizeof(void*));
+    view_set_context(app->cap_view, app);
+    view_set_draw_callback(app->cap_view, capture_draw);
+    view_set_input_callback(app->cap_view, capture_input);
+    view_dispatcher_add_view(app->vd, VIEW_CAP, app->cap_view);
+
     // install the permissive region for the scan (RX only); restored on exit
     const FuriHalRegion* orig_region = furi_hal_region_get();
     furi_hal_region_set((FuriHalRegion*)&s_region);
@@ -1341,16 +1599,21 @@ int32_t rf_survey_app(void* p) {
     // join the worker (no more radio/buffer writes), only then free views and data.
     furi_timer_stop(app->redraw);
     furi_timer_free(app->redraw);
+    capture_stop(app); // join a capture thread if one is somehow still running
     app->running = false;
-    furi_thread_join(app->worker);
-    furi_thread_free(app->worker);
+    if(app->worker) { // NULL only if we somehow exit mid-capture; normally restarted on Back
+        furi_thread_join(app->worker);
+        furi_thread_free(app->worker);
+    }
     furi_hal_region_set((FuriHalRegion*)orig_region); // restore the user's region
 
     view_dispatcher_remove_view(app->vd, VIEW_SPEC);
     view_dispatcher_remove_view(app->vd, VIEW_CONF);
     view_dispatcher_remove_view(app->vd, VIEW_RANGE);
+    view_dispatcher_remove_view(app->vd, VIEW_CAP);
     view_free(app->view);
     view_free(app->range_view);
+    view_free(app->cap_view);
     variable_item_list_free(app->conf);
     view_dispatcher_free(app->vd);
     furi_record_close(RECORD_GUI);
