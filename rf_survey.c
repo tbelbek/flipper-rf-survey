@@ -933,13 +933,10 @@ static void draw_numeric(Canvas* canvas, App* app) {
             b ? b->name : "");
         canvas_set_color(canvas, ColorXOR); // reverse over the filled part, normal over empty
         canvas_draw_str(canvas, 3, y + bh - 2, s);
+        // selected row (the one OK will capture): "OK" marker at the right end, no box
+        if(k == app->num_sel)
+            canvas_draw_str_aligned(canvas, SCR_W - 1, y + bh - 2, AlignRight, AlignBottom, "OK");
         canvas_set_color(canvas, ColorBlack);
-        // cursor bracket around the selected non-empty row (the one OK will capture)
-        if(k == app->num_sel) {
-            canvas_draw_line(canvas, 0, y - 1, SCR_W - 1, y - 1);
-            canvas_draw_line(canvas, 0, y + bh, SCR_W - 1, y + bh);
-            canvas_draw_line(canvas, SCR_W - 1, y - 1, SCR_W - 1, y + bh);
-        }
     }
     if(nshown == 0) canvas_draw_str(canvas, 2, 30, "no peaks yet (peak-hold)");
 }
