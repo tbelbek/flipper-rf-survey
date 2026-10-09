@@ -246,8 +246,7 @@ typedef struct {
     uint8_t num_sel; // numeric page: which of the top-4 is selected (OK captures it)
     volatile bool spec_active; // true only while the spectrum view is shown (gates the haptic)
     // locate-haptic state (persists across sweeps so the filter settles; see haptic_sample/pump)
-    int16_t hap_level; // peak-hold-with-decay of the selected freq's RSSI (dBm)
-    int8_t hap_raw; // last fresh RSSI of the selected freq (the silence gate reads this)
+    int16_t hap_level; // peak-hold-with-decay of the selected freq's RSSI (dBm); drives rate + gate
     uint32_t hap_next; // tick at which the vibro toggles next
     bool hap_on; // vibro currently held on
     struct {
@@ -441,7 +440,6 @@ static void haptic_off(App* app) {
     if(app->hap_on && app->notif) notification_message(app->notif, &sequence_reset_vibro);
     app->hap_on = false;
     app->hap_level = -127;
-    app->hap_raw = -127;
     app->hap_next = 0;
 }
 
@@ -453,7 +451,6 @@ static void haptic_off(App* app) {
 // decay so the rate stays steady through OOK keying gaps instead of flickering; +1 so the integer
 // >>3 can't stall ~7 dB short. State lives in App so it settles across sweeps.
 static void haptic_sample(App* app, int8_t raw) {
-    app->hap_raw = raw;
     if(raw > app->hap_level) {
         app->hap_level = raw;
     } else {
@@ -465,10 +462,13 @@ static void haptic_sample(App* app, int8_t raw) {
 // Non-blocking scheduler, called frequently (every few ms) by both workers so the tick cadence is
 // STEADY and decoupled from the sweep period -- that is what keeps it consistent. Pure RATE cue
 // (Geiger-counter): every pulse is the SAME short length, only the GAP tracks strength -- strong =
-// short gap (fast, close ticks), weak = long gap (slow, far ticks). Below the Trigger it is fully
-// silent (gated on the last fresh reading, so it stops the instant the signal drops out).
+// short gap (fast, close ticks), weak = long gap (slow, far ticks). The silence gate uses the
+// SMOOTHED level, not the raw read: CC1101 RSSI is noisy (+-several dB) and OOK is on/off keyed, so
+// gating on the instantaneous value flaps the motor on/off around the Trigger and feels erratic.
+// The peak-hold level is stable; it still falls below the Trigger within a few hundred ms once the
+// signal is really gone (bounded by the decay), so "silent below Trigger" still holds.
 static void haptic_pump(App* app, uint32_t now) {
-    if(app->hap_raw < app->trigger) {
+    if(app->hap_level < app->trigger) {
         if(app->hap_on) {
             notification_message(app->notif, &sequence_reset_vibro);
             app->hap_on = false;
@@ -615,6 +615,9 @@ static int32_t sweep_worker(void* ctx) {
                         furi_delay_ms(app->settle_ms);
                         float hrf = furi_hal_subghz_get_rssi();
                         haptic_sample(app, (hrf < -127.0f) ? (int8_t)-127 : (int8_t)hrf);
+                    } else {
+                        haptic_sample(
+                            app, -127); // selected freq in a band gap -> decay to silence
                     }
                     hap_last = tn;
                 }
