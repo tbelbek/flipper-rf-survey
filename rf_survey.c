@@ -387,24 +387,34 @@ static bool csv_flush(File* csv, const char* buf, int* off) {
     return ok;
 }
 
-// Return the register array to load for preset p at the current gain. Auto (0) uses the stock
-// array; Mid/Low copy it into preset_buf and patch AGCCTRL2 (0x1B) to cap the AGC's max usable
-// gain (stops a strong nearby source from saturating the front end). RX config only.
-static const uint8_t* preset_regs(App* app, uint8_t p, uint8_t gain) {
+// smallest CC1101 RX-filter bandwidth >= step, as the MDMCFG4 top nibble (CHANBW). Used when
+// zoomed so a carrier resolves to a sharp peak instead of a 650 kHz-wide mountain. 0xFF = leave
+// the preset's own wide BW (for the un-zoomed survey, so nothing falls between bins).
+static uint8_t bw_nibble(uint32_t step) {
+    if(step <= 58000) return 0xF; // 58 kHz
+    if(step <= 101000) return 0xC; // 101 kHz
+    if(step <= 270000) return 0x6; // 270 kHz
+    return 0xFF; // wider than 270 kHz -> keep the stock bandwidth
+}
+
+// Return the register array to load for preset p. Auto gain + wide BW (bwn==0xFF) use the stock
+// array untouched; otherwise copy it into preset_buf and patch AGCCTRL2 (0x1B, gain cap) and/or
+// MDMCFG4 (0x10, RX bandwidth -- keep the low data-rate nibble). RX config only.
+static const uint8_t* preset_regs(App* app, uint8_t p, uint8_t gain, uint8_t bwn) {
     const uint8_t* src = PRESETS[p].regs;
-    if(gain == 0) return src; // Auto / max gain -> stock preset untouched
+    if(gain == 0 && bwn == 0xFF) return src; // nothing to patch -> stock preset
     size_t i = 0;
     while(!(src[i] == 0 && src[i + 1] == 0))
         i += 2; // {0,0} terminates the reg pairs
     size_t total = i + 2 + 8; // pairs + terminator + 8-byte PA table
     if(total > sizeof(app->preset_buf)) return src; // too big -> fall back, never overflow
     memcpy(app->preset_buf, src, total);
-    uint8_t v = (gain == 1) ? 0x1F : 0xB7; // Mid: LNA-6dB  /  Low: LNA + DVGA reduced
-    for(size_t j = 0; j < i; j += 2)
-        if(app->preset_buf[j] == 0x1B) { // CC1101_AGCCTRL2
-            app->preset_buf[j + 1] = v;
-            break;
-        }
+    for(size_t j = 0; j < i; j += 2) {
+        if(gain != 0 && app->preset_buf[j] == 0x1B) // CC1101_AGCCTRL2
+            app->preset_buf[j + 1] = (gain == 1) ? 0x1F : 0xB7; // Mid / Low gain cap
+        if(bwn != 0xFF && app->preset_buf[j] == 0x10) // CC1101_MDMCFG4
+            app->preset_buf[j + 1] = (uint8_t)((bwn << 4) | (app->preset_buf[j + 1] & 0x0F));
+    }
     return app->preset_buf;
 }
 
@@ -417,19 +427,23 @@ static int32_t sweep_worker(void* ctx) {
 
     Storage* storage = furi_record_open(RECORD_STORAGE);
     File* csv = NULL; // open while recording; owned entirely by this thread
-    uint8_t cur_preset = 0xFF, cur_gain = 0xFF; // force a load on the first iteration
+    uint8_t cur_preset = 0xFF, cur_gain = 0xFF, cur_bw = 0x00; // force a load on the first loop
 
     while(app->running) {
-        // (re)load the CC1101 preset when the user picks a different preset or gain in config.
-        // Snapshot both once so a change between load and the cur_* assignment can't be lost.
+        // (re)load the CC1101 preset on a preset/gain change OR a zoom bandwidth change. When
+        // zoomed we narrow the RX filter to ~the step so a carrier shows a sharp peak, not a
+        // 650 kHz mountain; un-zoomed keeps the wide survey BW. Snapshot once each.
         uint8_t p = app->preset_idx, g = app->gain;
         if(p >= PRESET_N) p = 0;
-        if(cur_preset != p || cur_gain != g) {
+        uint8_t bwn = (app->zdepth > 0) ? bw_nibble(app->f_step) : 0xFF;
+        if(cur_preset != p || cur_gain != g || cur_bw != bwn) {
             furi_hal_subghz_idle();
-            furi_hal_subghz_load_custom_preset(preset_regs(app, p, g));
+            furi_hal_subghz_load_custom_preset(preset_regs(app, p, g, bwn));
             cur_preset = p;
             cur_gain = g;
-            FURI_LOG_I(TAG, "worker: preset -> %s gain %u", PRESETS[p].name, (unsigned)g);
+            cur_bw = bwn;
+            FURI_LOG_I(
+                TAG, "worker: preset -> %s gain %u bw %02X", PRESETS[p].name, (unsigned)g, bwn);
         }
         // apply a pending config change: recompute bins for the new range/step and
         // clear the buffers so stale readings from the old range don't linger
