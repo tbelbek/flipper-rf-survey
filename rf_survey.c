@@ -275,7 +275,11 @@ typedef struct {
     uint32_t cap_freq; // locked capture frequency (Hz)
     uint8_t cap_preset; // preset index for capture (user can toggle OOK/FSK)
     volatile bool capturing;
-    volatile bool cap_paused; // RSSI below trigger -> not writing (like the stock pause gate)
+    volatile bool cap_gate; // Up/Down: RSSI-gate the .sub (default off = record everything).
+        // Instantaneous RSSI of an OOK burst is mostly at the noise floor,
+        // so gating on the survey Trigger over-trims; off records the whole
+        // capture (the >=1 s / <50 us duration filter still drops junk).
+    volatile bool cap_paused; // gate engaged and RSSI below trigger -> not writing
     volatile int8_t cap_rssi; // last polled RSSI for the capture screen
     volatile uint32_t cap_samples; // durations written
     volatile uint32_t cap_overflow; // ISR drops (stream full) -> capture may be corrupt
@@ -1347,15 +1351,15 @@ static int32_t capture_worker(void* ctx) {
         int ind = 0;
         bool werr = false;
         uint32_t last_poll = 0;
-        app->cap_paused = true; // wait for signal before the first write (stock behaviour)
+        app->cap_paused = app->cap_gate; // if gating, wait for signal before the first write
         while(app->capturing && !werr && app->cap_samples < CAP_MAXSPL) {
-            // RSSI gate (stock read_raw does the same): poll the level ~50 Hz and pause writing
-            // while below the Trigger, so the .sub holds the bursts, not the dead air between.
+            // poll the level ~50 Hz for the on-screen readout; only PAUSE writing when the gate
+            // is on and we're below the Trigger (off by default -> record everything).
             uint32_t now = furi_get_tick();
             if(now - last_poll >= 20) {
                 float r = furi_hal_subghz_get_rssi();
                 app->cap_rssi = (r < -127.0f) ? (int8_t)-127 : (int8_t)r;
-                app->cap_paused = (app->cap_rssi < app->trigger);
+                app->cap_paused = app->cap_gate && (app->cap_rssi < app->trigger);
                 last_poll = now;
             }
             int32_t d;
@@ -1439,14 +1443,21 @@ static void capture_draw(Canvas* canvas, void* model) {
         app->cap_overflow ? " OVF!" : "");
     canvas_draw_str(canvas, 2, 45, line);
     if(app->capturing) {
-        // RSSI gate state: REC (writing, above trigger) vs WAIT (paused) + the live level
-        snprintf(
-            line,
-            sizeof(line),
-            "%s  %d/%d dBm",
-            app->cap_paused ? "WAIT" : "REC",
-            app->cap_rssi,
-            app->trigger);
+        // state line: REC (writing) / WAIT (gated, below trigger) + live level, and gate on/off
+        if(app->cap_gate)
+            snprintf(
+                line,
+                sizeof(line),
+                "%s %d>%d gate on",
+                app->cap_paused ? "WAIT" : "REC",
+                app->cap_rssi,
+                app->trigger);
+        else
+            snprintf(line, sizeof(line), "REC  %d dBm  gate off", app->cap_rssi);
+        canvas_draw_str(canvas, 2, 54, line);
+    } else {
+        // idle: show the gate setting so the user knows before pressing Rec
+        snprintf(line, sizeof(line), "gate %s (Up/Dn)", app->cap_gate ? "on" : "off");
         canvas_draw_str(canvas, 2, 54, line);
     }
 
@@ -1507,6 +1518,8 @@ static bool capture_input(InputEvent* e, void* ctx) {
             app->cap_preset = (uint8_t)((app->cap_preset + 1) % PRESET_N);
         else
             app->cap_preset = (uint8_t)((app->cap_preset + PRESET_N - 1) % PRESET_N);
+    } else if(e->key == InputKeyUp || e->key == InputKeyDown) {
+        app->cap_gate = !app->cap_gate; // RSSI gate on/off (off = record everything)
     }
     with_view_model(app->cap_view, void** m, { UNUSED(m); }, true);
     return true;
