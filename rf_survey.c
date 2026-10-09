@@ -88,7 +88,7 @@ static bool tune_rx(uint32_t f) {
 #define BODY_Y0    22 // top of the page body
 #define WF_ROWS    40 // waterfall freq rows (full-bleed height)
 #define WF_COLS    120 // waterfall time columns: one per completed sweep, ring
-#define WF_H       54 // waterfall pixel height (y 0..53, above the pills)
+#define WF_H       49 // waterfall heatmap height; y 49..63 holds the time scale + hints
 #define NBARS      32 // thick grouped bars (4px pitch) -> easy cursor stepping
 #define BAR_PITCH  (SCR_W / NBARS)
 #define RSSI_FLOOR -100.0f
@@ -175,6 +175,19 @@ static const FreqBand* preset_at(uint16_t i) {
 static const uint32_t STEP_HZ[] = {50000, 100000, 200000, 325000, 650000};
 static const char* const STEP_TXT[] = {"50k", "100k", "200k", "325k", "650k"};
 
+// time-window presets (seconds) for the connected/waterfall pages, Up/Down cycles them
+static const uint16_t WIN_SECS[] = {5, 10, 15, 20, 30, 45, 60, 90, 120, 180, 300, 420, 600};
+#define WIN_N       COUNT_OF(WIN_SECS)
+#define WIN_DEFAULT 6 // 60 s
+
+// "60s" / "2m" / "10m" into buf
+static void fmt_win(uint16_t s, char* buf, size_t n) {
+    if(s >= 60 && (s % 60) == 0)
+        snprintf(buf, n, "%um", (unsigned)(s / 60));
+    else
+        snprintf(buf, n, "%us", (unsigned)s);
+}
+
 typedef struct {
     // scan config
     uint32_t f_start;
@@ -200,7 +213,7 @@ typedef struct {
     uint32_t col_ms[WF_COLS];
     uint8_t wf_head;
     uint8_t wf_count;
-    volatile uint8_t win_sec; // display window for connected/waterfall pages (5..60 s)
+    volatile uint8_t win_idx; // index into WIN_SECS[] (connected/waterfall window)
     volatile int8_t trigger; // dBm floor: waterfall-lit / haptic / history / capture gate
     volatile bool haptic; // vibro pulse when a bin exceeds the trigger (hands-free locate)
 
@@ -625,7 +638,7 @@ static void draw_bars(Canvas* canvas, App* app, int floor, int ceil) {
 // One column == one sweep, so the mean of those columns IS the true per-sweep window mean
 // (no "average of per-slot maxima" fudge); peak = max over the same columns.
 static void wf_window_stats(const App* app, int r, uint32_t now, int* avg, int8_t* pk) {
-    uint32_t win_ms = (uint32_t)app->win_sec * 1000;
+    uint32_t win_ms = (uint32_t)WIN_SECS[app->win_idx] * 1000;
     int sum = 0, cnt = 0;
     int8_t p = -128;
     for(int c = 0; c < WF_COLS; c++) {
@@ -672,9 +685,10 @@ static void draw_connected(Canvas* canvas, App* app, int floor, int ceil) {
 // real sweep when sweeps are slower than 1px, never invents sub-sweep detail). Shows WHEN a
 // band is busy and the spacing of bursts. Edge labels give the range; center gives the span.
 static void draw_waterfall(Canvas* canvas, App* app) {
+    uint16_t win = WIN_SECS[app->win_idx];
     uint32_t newest = app->col_ms[app->wf_head];
     if(newest) {
-        uint32_t span = (uint32_t)app->win_sec * 1000;
+        uint32_t span = (uint32_t)win * 1000;
         uint32_t oldest = (newest > span) ? newest - span : 0;
         for(int x = 0; x < SCR_W; x++) {
             uint32_t t = oldest + (uint32_t)((uint64_t)(newest - oldest) * x / (SCR_W - 1));
@@ -699,16 +713,40 @@ static void draw_waterfall(Canvas* canvas, App* app) {
             }
         }
     }
-    // labels over the heatmap in XOR so they stay readable on lit or dark areas
+    // freq labels over the heatmap (XOR so they read on lit or dark cells); kept inside the
+    // heatmap band (y < WF_H) so they never collide with the scale/pills below
     char s[12];
     canvas_set_color(canvas, ColorXOR);
     snprintf(s, sizeof(s), "%lu", (unsigned long)(app->f_start / 1000000));
     canvas_draw_str(canvas, 1, 8, s); // top edge = start freq
     snprintf(s, sizeof(s), "%lu", (unsigned long)(app->f_end / 1000000));
-    canvas_draw_str(canvas, 1, WF_H - 1, s); // bottom edge = end freq
-    snprintf(s, sizeof(s), "%us", (unsigned)app->win_sec);
-    canvas_draw_str_aligned(canvas, 64, WF_H / 2, AlignCenter, AlignCenter, s); // center = window
+    canvas_draw_str(canvas, 1, WF_H - 2, s); // bottom of heatmap = end freq
     canvas_set_color(canvas, ColorBlack);
+
+    // time scale: baseline + tick notches at a "nice" division, newest (0) on the right.
+    // ~6 ticks; the division size is labelled so bursts' spacing can be read off the grid.
+    static const uint16_t NICE[] = {5, 10, 15, 30, 60, 120, 300};
+    uint16_t target = win / 6 ? win / 6 : 5;
+    uint16_t div = NICE[0];
+    for(size_t i = 0; i < COUNT_OF(NICE); i++)
+        if(NICE[i] <= target) div = NICE[i];
+    int sy = WF_H; // scale strip top
+    canvas_draw_line(canvas, 0, sy, SCR_W - 1, sy);
+    for(uint16_t dt = 0; dt <= win; dt += div) {
+        int x = (SCR_W - 1) - (int)((uint32_t)dt * (SCR_W - 1) / win);
+        canvas_draw_line(canvas, x, sy, x, sy + 3);
+    }
+    // bottom row: page hint, division size, window total
+    canvas_draw_str(canvas, 2, 62, "<>Pg");
+    char dv[12];
+    if(div >= 60 && (div % 60) == 0)
+        snprintf(dv, sizeof(dv), "%um/div", (unsigned)(div / 60));
+    else
+        snprintf(dv, sizeof(dv), "%us/div", (unsigned)div);
+    canvas_draw_str_aligned(canvas, 64, 62, AlignCenter, AlignBottom, dv);
+    char w[8];
+    fmt_win(win, w, sizeof(w));
+    canvas_draw_str_aligned(canvas, SCR_W - 1, 62, AlignRight, AlignBottom, w);
 }
 
 // Numeric page: 4 full-width horizontal bars (precise top-4 bins). Bar length ~ strength;
@@ -787,16 +825,18 @@ static void spectrum_draw(Canvas* canvas, void* model) {
         uint32_t fc = app->f_start / 2 + app->f_end / 2;
         const FreqBand* hb = band_lookup(fc);
         char hdr[48];
-        if(app->page == 1)
+        if(app->page == 1) {
+            char w[8];
+            fmt_win(WIN_SECS[app->win_idx], w, sizeof(w));
             snprintf(
                 hdr,
                 sizeof(hdr),
-                "%lu-%lu %s %us",
+                "%lu-%lu %s %s",
                 (unsigned long)(app->f_start / 1000000),
                 (unsigned long)(app->f_end / 1000000),
                 hb ? hb->name : "",
-                (unsigned)app->win_sec);
-        else
+                w);
+        } else
             snprintf(
                 hdr,
                 sizeof(hdr),
@@ -829,10 +869,12 @@ static void spectrum_draw(Canvas* canvas, void* model) {
             draw_connected(canvas, app, floor, ceil);
     }
 
-    // native pill hints
-    elements_button_left(canvas, "Page");
-    if(app->page == 0) elements_button_center(canvas, "Zoom");
-    if(app->zdepth) elements_button_right(canvas, "Out");
+    // native pill hints (the waterfall draws its own scale + page hint instead)
+    if(app->page != 2) {
+        elements_button_left(canvas, "Page");
+        if(app->page == 0) elements_button_center(canvas, "Zoom");
+        if(app->zdepth) elements_button_right(canvas, "Out");
+    }
 
     // recording indicator (long-OK toggles): filled dot + row count, top-right.
     // XOR on the full-bleed pages (2/3) so it reads over lit/dark cells.
@@ -879,14 +921,14 @@ static bool spectrum_input(InputEvent* event, void* context) {
         spec_redraw(app);
         return true;
     }
-    // Up/Down set the connected/waterfall time window (5..60 s)
+    // Up/Down cycle the connected/waterfall time window (5 s .. 10 min)
     if(event->key == InputKeyUp && sp) {
-        if(app->win_sec <= 55) app->win_sec += 5;
+        if(app->win_idx < (uint8_t)(WIN_N - 1)) app->win_idx++;
         spec_redraw(app);
         return true;
     }
     if(event->key == InputKeyDown && sp) {
-        if(app->win_sec >= 10) app->win_sec -= 5;
+        if(app->win_idx > 0) app->win_idx--;
         spec_redraw(app);
         return true;
     }
@@ -1138,7 +1180,7 @@ int32_t rf_survey_app(void* p) {
     app->settle_ms = 3;
     app->preset_idx = 0; // AM650: widest OOK filter, best broadband survey pickup
     app->cursor = NBARS / 2;
-    app->win_sec = 60; // default time window (max)
+    app->win_idx = WIN_DEFAULT; // 60 s
     app->trigger = -85; // default floor: above the CC1101 noise floor, below real signals
     app->haptic = false;
     // defensive against bad config (future editable ranges): never div-by-zero,
