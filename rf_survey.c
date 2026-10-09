@@ -444,8 +444,8 @@ static void haptic_off(App* app) {
 }
 
 #define HAP_PULSE   22 // fixed vibro pulse length (ms); only the GAP between pulses encodes strength
-#define HAP_GAP_MIN 160 // strongest signal -> ~160 ms gap (fastest ticks, still clearly separate)
-#define HAP_GAP_MAX 800 // at the Trigger floor -> ~800 ms gap (slow, far-apart ticks)
+#define HAP_GAP_MIN 300 // strongest signal -> ~300 ms gap (fastest ticks, still relaxed)
+#define HAP_GAP_MAX 1300 // at the Trigger floor -> ~1.3 s gap (slow, far-apart ticks)
 
 // Feed one FRESH RSSI reading of the selected frequency into the locate filter. Peak-hold with slow
 // decay so the rate stays steady through OOK keying gaps instead of flickering; +1 so the integer
