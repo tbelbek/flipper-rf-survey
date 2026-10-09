@@ -245,6 +245,10 @@ typedef struct {
     uint16_t cursor; // bars cursor column (framed); OK zooms into it
     uint8_t num_sel; // numeric page: which of the top-4 is selected (OK captures it)
     volatile bool spec_active; // true only while the spectrum view is shown (gates the haptic)
+    // locate-haptic state (persists across sweeps so the filter settles; see haptic_tick)
+    int16_t hap_level; // peak-hold-with-decay of the selected freq's RSSI (dBm)
+    uint32_t hap_next; // tick at which the vibro toggles next
+    bool hap_on; // vibro currently held on
     struct {
         uint32_t s, e, st;
     } zstack[4]; // zoom-out stack (previous ranges)
@@ -424,23 +428,61 @@ static const uint8_t* preset_regs(App* app, uint8_t p, uint8_t gain, uint8_t bwn
     return app->preset_buf;
 }
 
-// a short, light vibro tick for the locate cue (~25 ms, lighter than sequence_single_vibro)
-static const NotificationSequence seq_vibro_tick = {
-    &message_vibro_on,
-    &message_delay_25,
-    &message_vibro_off,
-    NULL,
-};
-
 // defined later; the worker needs them for the "selected frequency" haptic
 static uint32_t grp_freq(const App* app, uint16_t k);
 static void numeric_top4(const App* app, int tv[4], uint16_t tb[4]);
 
-// vibro gap (ms) for an RSSI relative to the Trigger: stronger -> faster ticks. 0 = don't tick.
-static uint16_t haptic_gap(const App* app, int8_t r) {
-    if(r <= app->trigger) return 0;
-    uint8_t over = (uint8_t)(r - app->trigger);
-    return over >= 20 ? 100 : over >= 12 ? 200 : over >= 6 ? 330 : 480;
+#define HAP_SPAN 30 // dB above Trigger that maps to full-strength vibration
+
+// stop the locate vibro and reset the filter. Call on every exit path (worker stop, view leave,
+// capture end, haptic turned off) -- otherwise sequence_set_vibro_on holds the motor ON forever.
+static void haptic_off(App* app) {
+    if(app->hap_on && app->notif) notification_message(app->notif, &sequence_reset_vibro);
+    app->hap_on = false;
+    app->hap_level = -127;
+    app->hap_next = 0;
+}
+
+// One non-blocking locate tick, shared by the sweep and capture workers. 'raw' is the latest RSSI
+// of the frequency being homed in on; 'now' is furi_get_tick() (ms). The motor is a binary ERM so
+// "little vs lots" is a DUTY CYCLE: weak -> short pulse / long gap (faint ticks), strong -> long
+// pulse / short gap (near-continuous). OOK carriers are on/off keyed, so a plain average drifts to
+// noise; instead peak-hold with slow decay tracks the carrier through its keying gaps. floor is the
+// user Trigger (below it = silent, no buzzing on noise), range is a fixed HAP_SPAN dB so the feel is
+// the same whatever the Trigger is set to. State lives in App so the filter settles across sweeps.
+static void haptic_tick(App* app, int8_t raw, uint32_t now) {
+    if(raw > app->hap_level) {
+        app->hap_level = raw; // fast attack to a burst
+    } else {
+        // slow decay (OOK-jitter cure); +1 so the integer >>3 can't stall ~7 dB short of the
+        // target and leave the motor faintly buzzing on noise after a strong signal stops.
+        int16_t d = app->hap_level - raw;
+        app->hap_level -= (int16_t)((d >> 3) + (d ? 1 : 0));
+    }
+
+    if(app->hap_level < app->trigger) { // selected freq below the floor -> silent
+        if(app->hap_on) {
+            notification_message(app->notif, &sequence_reset_vibro);
+            app->hap_on = false;
+        }
+        return;
+    }
+    if((int32_t)(now - app->hap_next) < 0) return; // wrap-safe: not time to toggle yet
+
+    int32_t lvl = ((int32_t)(app->hap_level - app->trigger) * 255) / HAP_SPAN;
+    if(lvl < 0) lvl = 0;
+    if(lvl > 255) lvl = 255;
+    uint16_t on_ms = (uint16_t)(20 + lvl * 40 / 255); //  20..60  (>=20ms so an ERM is felt)
+    uint16_t off_ms = (uint16_t)(280 - lvl * 260 / 255); // 280..20
+    if(app->hap_on) {
+        notification_message(app->notif, &sequence_reset_vibro);
+        app->hap_on = false;
+        app->hap_next = now + off_ms;
+    } else {
+        notification_message(app->notif, &sequence_set_vibro_on);
+        app->hap_on = true;
+        app->hap_next = now + on_ms;
+    }
 }
 
 // the frequency the user has SELECTED to home in on: the numeric page's chosen top-4 target,
@@ -585,11 +627,14 @@ static int32_t sweep_worker(void* ctx) {
                 furi_delay_ms(app->settle_ms);
                 float rf = furi_hal_subghz_get_rssi();
                 int8_t r = (rf < -127.0f) ? (int8_t)-127 : (int8_t)rf;
-                uint16_t gap = haptic_gap(app, r);
-                if(!gap) break; // selected freq quiet -> stop, resume sweeping
-                notification_message(app->notif, &seq_vibro_tick);
-                furi_delay_ms(gap);
+                haptic_tick(app, r, furi_get_tick());
             }
+        }
+        // never leave the motor latched on through the next full sweep (it would buzz ~0.6 s);
+        // release only the motor, keep hap_level so the peak-hold filter settles across sweeps.
+        if(app->hap_on) {
+            notification_message(app->notif, &sequence_reset_vibro);
+            app->hap_on = false;
         }
 
         // log one CSV row for this sweep: "t_ms,rssi0,..,rssiN", flushed in CSV_BUF chunks
@@ -624,6 +669,7 @@ static int32_t sweep_worker(void* ctx) {
         FURI_LOG_I(TAG, "csv: closed on exit, %lu rows", (unsigned long)app->rec_rows);
     }
     furi_record_close(RECORD_STORAGE);
+    haptic_off(app); // never leave the locate motor latched on
     FURI_LOG_I(TAG, "worker: exit, radio idle+sleep");
     furi_hal_subghz_idle();
     furi_hal_subghz_sleep();
@@ -1218,6 +1264,7 @@ static void spec_enter(void* ctx) {
 static void spec_exit(void* ctx) {
     App* app = ctx;
     app->spec_active = false;
+    haptic_off(app); // leaving the spectrum -> release the motor, reset the filter
 }
 
 // ---- custom range editor (VIEW_RANGE) --------------------------------------
@@ -1410,7 +1457,6 @@ static int32_t capture_worker(void* ctx) {
         int ind = 0;
         bool werr = false;
         uint32_t last_poll = 0;
-        uint32_t last_vibro = 0;
         app->cap_paused = app->cap_gate; // if gating, wait for signal before the first write
         while(app->capturing && !werr && app->cap_samples < CAP_MAXSPL) {
             // poll the level ~50 Hz for the on-screen readout; only PAUSE writing when the gate
@@ -1421,15 +1467,9 @@ static int32_t capture_worker(void* ctx) {
                 app->cap_rssi = (r < -127.0f) ? (int8_t)-127 : (int8_t)r;
                 app->cap_paused = app->cap_gate && (app->cap_rssi < app->trigger);
                 last_poll = now;
-                // same strength-tracked locate cue as the spectrum, but NON-blocking: this loop
-                // must keep draining the stream buffer, so just tick when the gap has elapsed.
-                if(app->haptic && app->notif) {
-                    uint16_t gap = haptic_gap(app, app->cap_rssi);
-                    if(gap && now - last_vibro >= gap) {
-                        notification_message(app->notif, &seq_vibro_tick);
-                        last_vibro = now;
-                    }
-                }
+                // same strength-tracked locate cue as the spectrum (non-blocking: haptic_tick only
+                // toggles when its own timer elapses, so the stream drain is never stalled).
+                if(app->haptic && app->notif) haptic_tick(app, app->cap_rssi, now);
             }
             int32_t d;
             if(furi_stream_buffer_receive(app->cap_stream, &d, sizeof(d), 20) == sizeof(d)) {
@@ -1457,6 +1497,7 @@ static int32_t capture_worker(void* ctx) {
         if(ind > 0) flipper_format_write_int32(ff, "RAW_Data", buf, (uint16_t)ind);
         furi_hal_subghz_idle();
         furi_hal_subghz_sleep();
+        haptic_off(app); // release the locate motor when the capture stops
         FURI_LOG_I(
             TAG,
             "cap: stop, %lu samples, %lu overflow",
@@ -1724,6 +1765,7 @@ int32_t rf_survey_app(void* p) {
     app->win_idx = WIN_DEFAULT; // 60 s
     app->trigger = -85; // default floor: above the CC1101 noise floor, below real signals
     app->haptic = false;
+    app->hap_level = -127; // seed the locate filter at the noise floor (0 would false-trigger)
     // defensive against bad config (future editable ranges): never div-by-zero,
     // never an inverted range, always 1..MAX_BINS bins, and keep f_end consistent
     // with the bins actually scanned so the axis labels can't lie.
