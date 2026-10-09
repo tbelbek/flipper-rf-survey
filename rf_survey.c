@@ -894,7 +894,7 @@ static void band_cb(VariableItem* item) {
     variable_item_set_current_value_text(item, b->name);
     app->f_start = b->lo;
     app->f_end = b->hi;
-    app->reconfig = true; // range only; the preset is an independent manual choice
+    app->reconfig = true;
     FURI_LOG_I(
         TAG,
         "config: band[%u]=%s %lu-%lu",
@@ -911,6 +911,12 @@ static void band_cb(VariableItem* item) {
         (unsigned long)(b->lo / 1000000),
         (unsigned long)(b->hi / 1000000));
     variable_item_set_current_value_text(app->it_range, r);
+    // suggest a matching preset from the band's modulation (AM bands -> AM650, FM -> FM238).
+    // Only a default: the user can still override the Modulation item afterwards.
+    uint8_t def = (b->mod == ModFM) ? 2 : 0;
+    app->preset_idx = def;
+    variable_item_set_current_value_index(app->it_preset, def);
+    variable_item_set_current_value_text(app->it_preset, PRESETS[def].name);
 }
 
 static void preset_cb(VariableItem* item) {
