@@ -275,6 +275,8 @@ typedef struct {
     uint32_t cap_freq; // locked capture frequency (Hz)
     uint8_t cap_preset; // preset index for capture (user can toggle OOK/FSK)
     volatile bool capturing;
+    volatile bool cap_paused; // RSSI below trigger -> not writing (like the stock pause gate)
+    volatile int8_t cap_rssi; // last polled RSSI for the capture screen
     volatile uint32_t cap_samples; // durations written
     volatile uint32_t cap_overflow; // ISR drops (stream full) -> capture may be corrupt
     FuriTimer* redraw;
@@ -1344,9 +1346,21 @@ static int32_t capture_worker(void* ctx) {
 
         int ind = 0;
         bool werr = false;
+        uint32_t last_poll = 0;
+        app->cap_paused = true; // wait for signal before the first write (stock behaviour)
         while(app->capturing && !werr && app->cap_samples < CAP_MAXSPL) {
+            // RSSI gate (stock read_raw does the same): poll the level ~50 Hz and pause writing
+            // while below the Trigger, so the .sub holds the bursts, not the dead air between.
+            uint32_t now = furi_get_tick();
+            if(now - last_poll >= 20) {
+                float r = furi_hal_subghz_get_rssi();
+                app->cap_rssi = (r < -127.0f) ? (int8_t)-127 : (int8_t)r;
+                app->cap_paused = (app->cap_rssi < app->trigger);
+                last_poll = now;
+            }
             int32_t d;
             if(furi_stream_buffer_receive(app->cap_stream, &d, sizeof(d), 20) == sizeof(d)) {
+                if(app->cap_paused) continue; // below trigger -> drain but don't record
                 buf[ind++] = d;
                 app->cap_samples++;
                 if(ind == 512) {
@@ -1416,10 +1430,23 @@ static void capture_draw(Canvas* canvas, void* model) {
 
     canvas_set_font(canvas, FontSecondary);
     char line[40];
-    snprintf(line, sizeof(line), "%s  %lu spl", ps->name, (unsigned long)app->cap_samples);
+    snprintf(
+        line,
+        sizeof(line),
+        "%s  %lu spl%s",
+        ps->name,
+        (unsigned long)app->cap_samples,
+        app->cap_overflow ? " OVF!" : "");
     canvas_draw_str(canvas, 2, 45, line);
-    if(app->cap_overflow) {
-        snprintf(line, sizeof(line), "overflow %lu!", (unsigned long)app->cap_overflow);
+    if(app->capturing) {
+        // RSSI gate state: REC (writing, above trigger) vs WAIT (paused) + the live level
+        snprintf(
+            line,
+            sizeof(line),
+            "%s  %d/%d dBm",
+            app->cap_paused ? "WAIT" : "REC",
+            app->cap_rssi,
+            app->trigger);
         canvas_draw_str(canvas, 2, 54, line);
     }
 
