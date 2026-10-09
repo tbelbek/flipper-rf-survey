@@ -523,7 +523,7 @@ static int32_t sweep_worker(void* ctx) {
     uint8_t cur_preset = 0xFF, cur_gain = 0xFF, cur_bw = 0x00; // force a load on the first loop
     uint32_t hap_last =
         0; // last locate-haptic sample time; persists across sweeps (not per-sweep,
-        // or a short zoomed sweep would resample every bin instead of every 30 ms)
+    // or a short zoomed sweep would resample every bin instead of every 30 ms)
 
     while(app->running) {
         // (re)load the CC1101 preset on a preset/gain change OR a zoom bandwidth change. When
@@ -1778,10 +1778,14 @@ static void conf_enter(void* ctx, uint32_t index) {
 
 static void redraw_cb(void* ctx) {
     App* app = ctx;
-    // commit the (empty) models to trigger a redraw; only the active view actually draws, so
-    // committing both the spectrum and the capture view is cheap and keeps whichever is up live
-    with_view_model(app->view, void** m, { UNUSED(m); }, true);
-    if(app->cap_view) with_view_model(app->cap_view, void** m, { UNUSED(m); }, true);
+    // commit only the view that is actually live + visible, so the timer does no work in the
+    // config / range editor (they redraw on input) and never commits the hidden view. The two
+    // live views are mutually exclusive: spec_active on the spectrum, capturing on the .sub screen.
+    if(app->spec_active) {
+        with_view_model(app->view, void** m, { UNUSED(m); }, true);
+    } else if(app->capturing && app->cap_view) {
+        with_view_model(app->cap_view, void** m, { UNUSED(m); }, true);
+    }
 }
 
 // ---- entry -----------------------------------------------------------------
