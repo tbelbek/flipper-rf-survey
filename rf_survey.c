@@ -460,7 +460,10 @@ static void haptic_tick(App* app, int8_t raw, uint32_t now) {
         app->hap_level -= (int16_t)((d >> 3) + (d ? 1 : 0));
     }
 
-    if(app->hap_level < app->trigger) { // selected freq below the floor -> silent
+    // gate on the INSTANTANEOUS reading, not the held level: the moment the selected freq drops
+    // below the Trigger the motor goes silent (the slow-decaying hap_level would otherwise linger
+    // above the floor and keep buzzing after the signal is already gone).
+    if(raw < app->trigger) {
         if(app->hap_on) {
             notification_message(app->notif, &sequence_reset_vibro);
             app->hap_on = false;
