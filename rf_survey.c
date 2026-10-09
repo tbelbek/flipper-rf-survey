@@ -203,6 +203,8 @@ typedef struct {
     uint16_t nbins;
     uint8_t settle_ms;
     volatile uint8_t preset_idx; // index into PRESETS[]; worker reloads the CC1101 on change
+    volatile uint8_t gain; // 0 Auto(max) / 1 Mid / 2 Low -- caps the AGC's max usable gain
+    uint8_t preset_buf[128]; // RAM copy of a preset with AGCCTRL2 patched (for Mid/Low gain)
     volatile bool reconfig; // config changed -> worker recomputes bins + resets buffers
 
     // scan data as int8 dBm (worker writes, GUI reads; per-byte loads/stores are
@@ -384,6 +386,27 @@ static bool csv_flush(File* csv, const char* buf, int* off) {
     return ok;
 }
 
+// Return the register array to load for preset p at the current gain. Auto (0) uses the stock
+// array; Mid/Low copy it into preset_buf and patch AGCCTRL2 (0x1B) to cap the AGC's max usable
+// gain (stops a strong nearby source from saturating the front end). RX config only.
+static const uint8_t* preset_regs(App* app, uint8_t p) {
+    const uint8_t* src = PRESETS[p].regs;
+    if(app->gain == 0) return src; // Auto / max gain -> stock preset untouched
+    size_t i = 0;
+    while(!(src[i] == 0 && src[i + 1] == 0))
+        i += 2; // {0,0} terminates the reg pairs
+    size_t total = i + 2 + 8; // pairs + terminator + 8-byte PA table
+    if(total > sizeof(app->preset_buf)) return src; // too big -> fall back, never overflow
+    memcpy(app->preset_buf, src, total);
+    uint8_t v = (app->gain == 1) ? 0x1F : 0xB7; // Mid: LNA-6dB  /  Low: LNA + DVGA reduced
+    for(size_t j = 0; j < i; j += 2)
+        if(app->preset_buf[j] == 0x1B) { // CC1101_AGCCTRL2
+            app->preset_buf[j + 1] = v;
+            break;
+        }
+    return app->preset_buf;
+}
+
 // ---- radio sweep worker ----------------------------------------------------
 
 static int32_t sweep_worker(void* ctx) {
@@ -393,17 +416,18 @@ static int32_t sweep_worker(void* ctx) {
 
     Storage* storage = furi_record_open(RECORD_STORAGE);
     File* csv = NULL; // open while recording; owned entirely by this thread
-    uint8_t cur_preset = 0xFF; // force a load on the first iteration
+    uint8_t cur_preset = 0xFF, cur_gain = 0xFF; // force a load on the first iteration
 
     while(app->running) {
-        // (re)load the CC1101 preset when the user picks a different one in config
-        if(cur_preset != app->preset_idx) {
+        // (re)load the CC1101 preset when the user picks a different preset or gain in config
+        if(cur_preset != app->preset_idx || cur_gain != app->gain) {
             uint8_t p = app->preset_idx;
             if(p >= PRESET_N) p = 0;
             furi_hal_subghz_idle();
-            furi_hal_subghz_load_custom_preset(PRESETS[p].regs);
+            furi_hal_subghz_load_custom_preset(preset_regs(app, p));
             cur_preset = p;
-            FURI_LOG_I(TAG, "worker: preset -> %s", PRESETS[p].name);
+            cur_gain = app->gain;
+            FURI_LOG_I(TAG, "worker: preset -> %s gain %u", PRESETS[p].name, (unsigned)app->gain);
         }
         // apply a pending config change: recompute bins for the new range/step and
         // clear the buffers so stale readings from the old range don't linger
@@ -1454,6 +1478,15 @@ static void haptic_cb(VariableItem* item) {
     variable_item_set_current_value_text(item, app->haptic ? "On" : "Off");
 }
 
+static const char* const GAIN_TXT[] = {"Auto", "Mid", "Low"};
+static void gain_cb(VariableItem* item) {
+    App* app = variable_item_get_context(item);
+    uint8_t idx = variable_item_get_current_value_index(item);
+    if(idx >= COUNT_OF(GAIN_TXT)) idx = 0;
+    app->gain = idx; // worker reloads the preset with patched AGC next loop
+    variable_item_set_current_value_text(item, GAIN_TXT[idx]);
+}
+
 static void conf_enter(void* ctx, uint32_t index) {
     App* app = ctx;
     if(index == 1) { // "Range MHz" row -> open the custom range editor
@@ -1555,6 +1588,9 @@ int32_t rf_survey_app(void* p) {
     vi = variable_item_list_add(app->conf, "Haptic", 2, haptic_cb, app);
     variable_item_set_current_value_index(vi, app->haptic ? 1 : 0);
     variable_item_set_current_value_text(vi, app->haptic ? "On" : "Off");
+    vi = variable_item_list_add(app->conf, "Gain", COUNT_OF(GAIN_TXT), gain_cb, app);
+    variable_item_set_current_value_index(vi, app->gain);
+    variable_item_set_current_value_text(vi, GAIN_TXT[app->gain]);
     variable_item_list_set_enter_callback(app->conf, conf_enter, app);
     view_set_previous_callback(variable_item_list_get_view(app->conf), view_exit);
     view_dispatcher_add_view(app->vd, VIEW_CONF, variable_item_list_get_view(app->conf));
