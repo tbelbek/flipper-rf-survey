@@ -245,8 +245,9 @@ typedef struct {
     uint16_t cursor; // bars cursor column (framed); OK zooms into it
     uint8_t num_sel; // numeric page: which of the top-4 is selected (OK captures it)
     volatile bool spec_active; // true only while the spectrum view is shown (gates the haptic)
-    // locate-haptic state (persists across sweeps so the filter settles; see haptic_tick)
+    // locate-haptic state (persists across sweeps so the filter settles; see haptic_sample/pump)
     int16_t hap_level; // peak-hold-with-decay of the selected freq's RSSI (dBm)
+    int8_t hap_raw; // last fresh RSSI of the selected freq (the silence gate reads this)
     uint32_t hap_next; // tick at which the vibro toggles next
     bool hap_on; // vibro currently held on
     struct {
@@ -440,6 +441,7 @@ static void haptic_off(App* app) {
     if(app->hap_on && app->notif) notification_message(app->notif, &sequence_reset_vibro);
     app->hap_on = false;
     app->hap_level = -127;
+    app->hap_raw = -127;
     app->hap_next = 0;
 }
 
@@ -447,25 +449,26 @@ static void haptic_off(App* app) {
 #define HAP_GAP_MIN 70 // strongest signal -> ~70 ms gap (fast, closely-spaced ticks)
 #define HAP_GAP_MAX 520 // at the Trigger floor -> ~520 ms gap (slow, far-apart ticks)
 
-// One non-blocking locate tick, shared by the sweep and capture workers. 'raw' is the latest RSSI
-// of the frequency being homed in on; 'now' is furi_get_tick() (ms). Pure RATE cue (Geiger-counter
-// feel): every pulse is the SAME short length, only the GAP between pulses tracks strength -- strong
-// = short gap (fast ticks), weak = long gap (slow ticks). This is far more consistent than varying
-// the pulse width/duty. Below the Trigger it is fully silent (gated on the instantaneous reading).
-// The gap itself is derived from a peak-hold-with-slow-decay of the RSSI so the RATE stays steady
-// through OOK keying gaps instead of flickering; that state lives in App so it settles across sweeps.
-static void haptic_tick(App* app, int8_t raw, uint32_t now) {
+// Feed one FRESH RSSI reading of the selected frequency into the locate filter. Peak-hold with slow
+// decay so the rate stays steady through OOK keying gaps instead of flickering; +1 so the integer
+// >>3 can't stall ~7 dB short. State lives in App so it settles across sweeps.
+static void haptic_sample(App* app, int8_t raw) {
+    app->hap_raw = raw;
     if(raw > app->hap_level) {
-        app->hap_level = raw; // fast attack to a burst
+        app->hap_level = raw;
     } else {
-        // slow decay (OOK-jitter cure); +1 so the integer >>3 can't stall ~7 dB short of the target.
         int16_t d = app->hap_level - raw;
         app->hap_level -= (int16_t)((d >> 3) + (d ? 1 : 0));
     }
+}
 
-    // gate on the INSTANTANEOUS reading: the moment the selected freq drops below the Trigger the
-    // motor goes silent -- no lingering buzz from the slow-decaying held level.
-    if(raw < app->trigger) {
+// Non-blocking scheduler, called frequently (every few ms) by both workers so the tick cadence is
+// STEADY and decoupled from the sweep period -- that is what keeps it consistent. Pure RATE cue
+// (Geiger-counter): every pulse is the SAME short length, only the GAP tracks strength -- strong =
+// short gap (fast, close ticks), weak = long gap (slow, far ticks). Below the Trigger it is fully
+// silent (gated on the last fresh reading, so it stops the instant the signal drops out).
+static void haptic_pump(App* app, uint32_t now) {
+    if(app->hap_raw < app->trigger) {
         if(app->hap_on) {
             notification_message(app->notif, &sequence_reset_vibro);
             app->hap_on = false;
@@ -583,20 +586,39 @@ static int32_t sweep_worker(void* ctx) {
         uint32_t fs = app->f_start, st = app->f_step;
         int8_t smax = -128; // this sweep's strongest bin + its index (haptic + history)
         uint16_t smaxi = 0;
+        uint32_t hap_last = 0; // last time we sampled the selected freq for the locate haptic
         for(uint16_t i = 0; i < app->nbins && app->running; i++) {
             uint32_t f = fs + (uint32_t)i * st;
-            if(!furi_hal_subghz_is_frequency_valid(f) || !tune_rx(f)) {
+            if(furi_hal_subghz_is_frequency_valid(f) && tune_rx(f)) {
+                furi_delay_ms(app->settle_ms);
+                float rf = furi_hal_subghz_get_rssi();
+                int8_t r = (rf < -127.0f) ? (int8_t)-127 : (int8_t)rf; // keep -128 as the sentinel
+                app->rssi[i] = r;
+                if(r > app->peak[i]) app->peak[i] = r;
+                if(r > smax) {
+                    smax = r;
+                    smaxi = i;
+                }
+            } else {
                 app->rssi[i] = -128; // sentinel: band gap / invalid / un-tunable
-                continue;
             }
-            furi_delay_ms(app->settle_ms);
-            float rf = furi_hal_subghz_get_rssi();
-            int8_t r = (rf < -127.0f) ? (int8_t)-127 : (int8_t)rf; // keep -128 as the sentinel
-            app->rssi[i] = r;
-            if(r > app->peak[i]) app->peak[i] = r;
-            if(r > smax) {
-                smax = r;
-                smaxi = i;
+            // Service the locate haptic DURING the sweep (not after it) so the ticks stay steady --
+            // this is what kills the "fast burst then ~0.6 s silence" beat. Sample the SELECTED
+            // frequency ~every 30 ms (responsive gate + rate; one extra tune, the next bin retunes
+            // anyway) and pump the scheduler every bin. Pump is non-blocking: it only toggles the
+            // motor when its own timer elapses, so it never stalls the sweep.
+            if(app->haptic && app->notif && app->spec_active) {
+                uint32_t tn = furi_get_tick();
+                if(tn - hap_last >= 30) {
+                    uint32_t sf = selected_freq(app);
+                    if(furi_hal_subghz_is_frequency_valid(sf) && tune_rx(sf)) {
+                        furi_delay_ms(app->settle_ms);
+                        float hrf = furi_hal_subghz_get_rssi();
+                        haptic_sample(app, (hrf < -127.0f) ? (int8_t)-127 : (int8_t)hrf);
+                    }
+                    hap_last = tn;
+                }
+                haptic_pump(app, furi_get_tick());
             }
         }
         // commit this sweep as one waterfall column: max-fold the bins to WF_ROWS freq rows,
@@ -616,30 +638,6 @@ static int32_t sweep_worker(void* ctx) {
 
         // above-trigger peak this sweep -> busy-channel history
         if(smax > app->trigger) hist_add(app, (uint16_t)((fs + (uint32_t)smaxi * st) / 1000000));
-
-        // responsive haptic locate: tick on the frequency the USER SELECTED (the bars cursor or
-        // the numeric page's chosen target), not the strongest bin -- the point is to home in on
-        // the band you picked. Re-read just that one frequency fast and tick at a rate that tracks
-        // its strength, decoupled from the slow full-sweep period so it reacts at once instead of
-        // once per sweep. Bounded to ~0.5 s so the display still refreshes; stops as soon as the
-        // selected frequency drops below the trigger. Only while the spectrum is shown.
-        if(app->haptic && app->notif && app->spec_active) {
-            uint32_t sel_f = selected_freq(app);
-            uint32_t t_end = furi_get_tick() + 500;
-            while(app->running && app->haptic && app->spec_active && furi_get_tick() < t_end) {
-                if(!tune_rx(sel_f)) break;
-                furi_delay_ms(app->settle_ms);
-                float rf = furi_hal_subghz_get_rssi();
-                int8_t r = (rf < -127.0f) ? (int8_t)-127 : (int8_t)rf;
-                haptic_tick(app, r, furi_get_tick());
-            }
-        }
-        // never leave the motor latched on through the next full sweep (it would buzz ~0.6 s);
-        // release only the motor, keep hap_level so the peak-hold filter settles across sweeps.
-        if(app->hap_on) {
-            notification_message(app->notif, &sequence_reset_vibro);
-            app->hap_on = false;
-        }
 
         // log one CSV row for this sweep: "t_ms,rssi0,..,rssiN", flushed in CSV_BUF chunks
         // (one FAT sector) so the row buffer stays 512 B instead of ~5 KB.
@@ -1471,9 +1469,12 @@ static int32_t capture_worker(void* ctx) {
                 app->cap_rssi = (r < -127.0f) ? (int8_t)-127 : (int8_t)r;
                 app->cap_paused = app->cap_gate && (app->cap_rssi < app->trigger);
                 last_poll = now;
-                // same strength-tracked locate cue as the spectrum (non-blocking: haptic_tick only
-                // toggles when its own timer elapses, so the stream drain is never stalled).
-                if(app->haptic && app->notif) haptic_tick(app, app->cap_rssi, now);
+                // same strength-tracked locate cue as the spectrum (non-blocking: pump only toggles
+                // when its own timer elapses, so the stream drain is never stalled).
+                if(app->haptic && app->notif) {
+                    haptic_sample(app, app->cap_rssi);
+                    haptic_pump(app, now);
+                }
             }
             int32_t d;
             if(furi_stream_buffer_receive(app->cap_stream, &d, sizeof(d), 20) == sizeof(d)) {
