@@ -263,7 +263,6 @@ typedef struct {
     // custom-range editor (VIEW_RANGE): start/end in 100 kHz units (779.0 MHz = 7790)
     View* range_view;
     uint32_t re_start, re_end;
-    uint8_t re_field; // 0 = editing Start, 1 = editing End
     uint8_t re_cur; // active digit 0..3 (hundreds, tens, ones, tenths)
 
     // .sub capture (VIEW_CAP): a dedicated thread owns the file+stream; the ISR only feeds
@@ -1049,7 +1048,7 @@ static void spectrum_draw(Canvas* canvas, void* model) {
         elements_button_left(canvas, "Page");
         if(app->page == 0) elements_button_center(canvas, "Zoom");
         if(app->page == 3) elements_button_center(canvas, "Capture"); // OK on the cursor row
-        if(app->zdepth) elements_button_right(canvas, "Out");
+        // (zoom-out is Back -- no right pill, Right flips pages like elsewhere)
     }
 
     // recording indicator (long-OK toggles): filled dot + row count, top-right.
@@ -1180,12 +1179,15 @@ static void range_draw(Canvas* canvas, void* model) {
     App* app = g_app;
     if(!app) return;
     canvas_clear(canvas);
-    uint32_t a = app->re_field ? app->re_end : app->re_start;
+    // the cursor spans both numbers: digits 0..3 edit Start, 4..7 edit End
+    uint8_t field = app->re_cur < 4 ? 0 : 1; // 0 = Start, 1 = End
+    uint8_t digit = app->re_cur % 4;
+    uint32_t a = field ? app->re_end : app->re_start;
     char big[12];
     snprintf(big, sizeof(big), "%lu.%lu", (unsigned long)(a / 10), (unsigned long)(a % 10));
 
     canvas_set_font(canvas, FontSecondary);
-    canvas_draw_str(canvas, 2, 9, app->re_field ? "End" : "Start");
+    canvas_draw_str(canvas, 2, 9, field ? "End" : "Start");
     canvas_draw_str(canvas, 108, 9, "MHz");
 
     // inverted box with the big number (like the analyzer's locked readout)
@@ -1194,7 +1196,7 @@ static void range_draw(Canvas* canvas, void* model) {
     canvas_set_font(canvas, FontBigNumbers);
     canvas_draw_str(canvas, 6, 30, big);
     // underline the active digit (digit idx -> char idx; the '.' is char 3)
-    int ci = app->re_cur < 3 ? app->re_cur : 4;
+    int ci = digit < 3 ? digit : 4;
     char pre[8];
     memcpy(pre, big, (size_t)ci);
     pre[ci] = 0;
@@ -1206,23 +1208,22 @@ static void range_draw(Canvas* canvas, void* model) {
 
     // the other field + the resulting span, below the box
     canvas_set_font(canvas, FontSecondary);
-    uint32_t o = app->re_field ? app->re_start : app->re_end;
+    uint32_t o = field ? app->re_start : app->re_end;
     uint32_t span = (app->re_end > app->re_start) ? app->re_end - app->re_start : 0;
     char info[40];
     snprintf(
         info,
         sizeof(info),
         "%s %lu.%lu  span %lu.%lu",
-        app->re_field ? "Start" : "End",
+        field ? "Start" : "End",
         (unsigned long)(o / 10),
         (unsigned long)(o % 10),
         (unsigned long)(span / 10),
         (unsigned long)(span % 10));
     canvas_draw_str(canvas, 2, 46, info);
 
-    elements_button_left(canvas, "Digit");
-    elements_button_center(canvas, "Swap");
-    elements_button_right(canvas, "Set");
+    elements_button_left(canvas, "Digit"); // Left/Right move the cursor across both numbers
+    elements_button_center(canvas, "Set"); // OK applies; Back cancels
 }
 
 static bool range_input(InputEvent* e, void* ctx) {
@@ -1232,7 +1233,11 @@ static bool range_input(InputEvent* e, void* ctx) {
     bool act = (e->type == InputTypeShort || e->type == InputTypeRepeat);
 
     if(e->key == InputKeyBack && e->type == InputTypeShort) {
-        // validate: clamp to the CC1101 window and enforce a minimum span, then apply
+        view_dispatcher_switch_to_view(app->vd, VIEW_CONF); // cancel: leave the range unchanged
+        return true;
+    }
+    if(e->key == InputKeyOk && e->type == InputTypeShort) {
+        // Set: validate (clamp to the CC1101 window, enforce a minimum span), apply, return
         if(app->re_start < RE_MIN) app->re_start = RE_MIN;
         if(app->re_end > RE_MAX) app->re_end = RE_MAX;
         if(app->re_end < app->re_start + RE_SPAN) {
@@ -1259,18 +1264,19 @@ static bool range_input(InputEvent* e, void* ctx) {
         return true;
     }
 
-    uint32_t* v = app->re_field ? &app->re_end : &app->re_start;
-    if(e->key == InputKeyOk && e->type == InputTypeShort) {
-        app->re_field ^= 1; // swap Start <-> End
-    } else if(e->key == InputKeyLeft && act) {
+    // the cursor spans both numbers (0..3 Start, 4..7 End); Up/Down edit the active digit
+    uint8_t field = app->re_cur < 4 ? 0 : 1;
+    uint8_t digit = app->re_cur % 4;
+    uint32_t* v = field ? &app->re_end : &app->re_start;
+    if(e->key == InputKeyLeft && act) {
         if(app->re_cur > 0) app->re_cur--;
     } else if(e->key == InputKeyRight && act) {
-        if(app->re_cur < 3) app->re_cur++;
+        if(app->re_cur < 7) app->re_cur++;
     } else if(e->key == InputKeyUp && act) {
-        uint32_t nv = *v + RE_PLACE[app->re_cur];
+        uint32_t nv = *v + RE_PLACE[digit];
         *v = (nv > RE_MAX) ? RE_MAX : nv;
     } else if(e->key == InputKeyDown && act) {
-        uint32_t p = RE_PLACE[app->re_cur];
+        uint32_t p = RE_PLACE[digit];
         *v = (*v > RE_MIN + p) ? (*v - p) : RE_MIN;
     } else {
         return true;
@@ -1615,7 +1621,6 @@ static void conf_enter(void* ctx, uint32_t index) {
         app->re_end = app->f_end / 100000;
         if(app->re_start < RE_MIN) app->re_start = RE_MIN;
         if(app->re_end > RE_MAX) app->re_end = RE_MAX;
-        app->re_field = 0;
         app->re_cur = 0;
         FURI_LOG_I(TAG, "config: open range editor");
         view_dispatcher_switch_to_view(app->vd, VIEW_RANGE);
