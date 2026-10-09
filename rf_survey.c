@@ -863,7 +863,7 @@ static void numeric_top4(const App* app, int tv[4], uint16_t tb[4]) {
     tb[0] = tb[1] = tb[2] = tb[3] = 0;
     for(uint16_t i = 0; i < app->nbins; i++) {
         int v = app->peak[i]; // rank by peak-hold, not live RSSI, so the list doesn't jitter
-        if(v <= -128) continue;
+        if(v <= app->trigger) continue; // only real peaks above the floor (no noise filling slots)
         uint32_t fi = app->f_start + (uint32_t)i * app->f_step;
         int grp = -1; // same-peak slot, if any
         for(int m = 0; m < 4; m++) {
@@ -940,7 +940,7 @@ static void draw_numeric(Canvas* canvas, App* app) {
             canvas_draw_str_aligned(canvas, SCR_W - 1, y + bh - 2, AlignRight, AlignBottom, "OK");
         canvas_set_color(canvas, ColorBlack);
     }
-    if(nshown == 0) canvas_draw_str(canvas, 2, 30, "no peaks yet (peak-hold)");
+    if(nshown == 0) canvas_draw_str(canvas, 2, 30, "no peaks above trigger");
 }
 
 // History page: the session's busiest 1 MHz channels (peaked above the trigger), sorted by
