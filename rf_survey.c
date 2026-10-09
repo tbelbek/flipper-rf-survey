@@ -414,16 +414,22 @@ static void draw_bars(Canvas* canvas, App* app, int floor, int ceil) {
     canvas_draw_frame(canvas, cx - 1, BODY_Y0 - 2, BAR_PITCH + 1, BASE_Y - BODY_Y0 + 3);
 }
 
-static void draw_waterfall(Canvas* canvas, App* app, int floor, int ceil) {
-    int thr = floor + (ceil - floor) * 3 / 10; // activity threshold within the dynamic window
-    for(uint8_t r = 0; r < app->hist_count && r < HIST_ROWS; r++) {
-        uint8_t idx = (uint8_t)((app->hist_head + HIST_ROWS - 1 - r) % HIST_ROWS);
-        int y = BODY_Y0 + r;
-        if(y > BASE_Y) break;
-        const int8_t* row = app->hist[idx];
-        for(int px = 0; px < SCR_W; px++)
-            if(row[px] > thr) canvas_draw_dot(canvas, px, y);
+// Persistence spectrum: for each frequency column, a solid bar whose height = the fraction
+// of the last N sweeps that column was active (above threshold). A constant transmitter is
+// a full bar, an intermittent/bursty one a partial bar, silence is empty. Crisp in 1-bit
+// (no dither needed) and the right view for "is a signal appearing over time".
+static void draw_persistence(Canvas* canvas, App* app, int floor, int ceil) {
+    int thr = floor + (ceil - floor) * 3 / 10;
+    int n = app->hist_count ? app->hist_count : 1;
+    for(int px = 0; px < SCR_W; px++) {
+        int cnt = 0;
+        for(uint8_t r = 0; r < app->hist_count && r < HIST_ROWS; r++) {
+            if(app->hist[r][px] > thr) cnt++;
+        }
+        int h = cnt * MAX_H / n;
+        if(h > 0) canvas_draw_line(canvas, px, BASE_Y, px, BASE_Y - h);
     }
+    canvas_draw_line(canvas, 0, BASE_Y + 1, SCR_W - 1, BASE_Y + 1);
 }
 
 // Numeric page: 4 full-width horizontal bars (precise top-4 bins). Bar length ~ strength;
@@ -529,7 +535,7 @@ static void spectrum_draw(Canvas* canvas, void* model) {
         if(app->page == 0)
             draw_bars(canvas, app, floor, ceil);
         else
-            draw_waterfall(canvas, app, floor, ceil);
+            draw_persistence(canvas, app, floor, ceil);
     }
 
     // native pill hints
