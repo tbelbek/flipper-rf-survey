@@ -1449,7 +1449,8 @@ static void capture_draw(Canvas* canvas, void* model) {
                 app->cap_overflow ? "!" : "",
                 app->cap_rssi);
     } else {
-        snprintf(line, sizeof(line), "RSSI filter: %s  (Up/Dn)", app->cap_gate ? "on" : "off");
+        // idle: Up/Dn tunes the frequency, long-OK toggles the filter
+        snprintf(line, sizeof(line), "Up/Dn tune  filter:%s", app->cap_gate ? "on" : "off");
     }
     canvas_draw_str(canvas, 2, 45, line);
 
@@ -1487,9 +1488,10 @@ static bool capture_input(InputEvent* e, void* ctx) {
     UNUSED(ctx);
     App* app = g_app;
     if(!app) return false;
-    if(e->type != InputTypeShort) return true;
+    bool sp = (e->type == InputTypeShort || e->type == InputTypeRepeat);
+    bool lp = (e->type == InputTypeLong);
 
-    if(e->key == InputKeyBack) {
+    if(e->key == InputKeyBack && e->type == InputTypeShort) {
         capture_stop(app);
         // restart a fresh survey worker (re-inits the radio exactly like first boot)
         app->running = true;
@@ -1499,19 +1501,29 @@ static bool capture_input(InputEvent* e, void* ctx) {
         view_dispatcher_switch_to_view(app->vd, VIEW_SPEC);
         return true;
     }
-    if(e->key == InputKeyOk) {
+    if(e->key == InputKeyOk && e->type == InputTypeShort) {
         if(app->capturing)
             capture_stop(app);
         else
             capture_start(app);
-    } else if((e->key == InputKeyLeft || e->key == InputKeyRight) && !app->capturing) {
-        // toggle the capture modulation (OOK vs 2FSK) -- the user must match the signal
+    } else if(e->key == InputKeyOk && lp && !app->capturing) {
+        app->cap_gate = !app->cap_gate; // long-OK: RSSI filter on/off (off = record everything)
+    } else if(!app->capturing && sp && (e->key == InputKeyLeft || e->key == InputKeyRight)) {
+        // Left/Right: capture modulation (OOK vs 2FSK) -- the user must match the signal
         if(e->key == InputKeyRight)
             app->cap_preset = (uint8_t)((app->cap_preset + 1) % PRESET_N);
         else
             app->cap_preset = (uint8_t)((app->cap_preset + PRESET_N - 1) % PRESET_N);
-    } else if(e->key == InputKeyUp || e->key == InputKeyDown) {
-        app->cap_gate = !app->cap_gate; // RSSI gate on/off (off = record everything)
+    } else if(!app->capturing && sp && (e->key == InputKeyUp || e->key == InputKeyDown)) {
+        // Up/Down: fine-tune the capture frequency by 10 kHz, clamped to the CC1101 range
+        uint32_t f = app->cap_freq;
+        if(e->key == InputKeyUp)
+            f = (f <= 928000000 - 10000) ? f + 10000 : 928000000;
+        else
+            f = (f >= 300000000 + 10000) ? f - 10000 : 300000000;
+        app->cap_freq = f;
+    } else {
+        return true;
     }
     with_view_model(app->cap_view, void** m, { UNUSED(m); }, true);
     return true;
