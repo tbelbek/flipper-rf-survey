@@ -1416,8 +1416,8 @@ static void capture_draw(Canvas* canvas, void* model) {
     const SurveyPreset* ps = &PRESETS[app->cap_preset < PRESET_N ? app->cap_preset : 0];
 
     canvas_set_font(canvas, FontSecondary);
-    canvas_draw_str(canvas, 2, 9, app->capturing ? "Capturing .sub" : "Capture .sub");
-    canvas_draw_str(canvas, 108, 9, "MHz");
+    canvas_draw_str(canvas, 2, 9, "Capture .sub");
+    canvas_draw_str_aligned(canvas, 126, 9, AlignRight, AlignBottom, ps->name); // preset, right
 
     canvas_draw_box(canvas, 2, 12, 124, 22);
     canvas_set_color(canvas, ColorWhite);
@@ -1430,36 +1430,28 @@ static void capture_draw(Canvas* canvas, void* model) {
         (unsigned long)(app->cap_freq / 1000000),
         (unsigned long)((app->cap_freq / 1000) % 1000));
     canvas_draw_str(canvas, 6, 30, big);
+    canvas_set_font(canvas, FontSecondary);
+    canvas_draw_str(canvas, 104, 30, "MHz"); // small, inside the box next to the number
     canvas_set_color(canvas, ColorBlack);
 
+    // one status line above the pills (never over them)
     canvas_set_font(canvas, FontSecondary);
     char line[40];
-    snprintf(
-        line,
-        sizeof(line),
-        "%s  %lu spl%s",
-        ps->name,
-        (unsigned long)app->cap_samples,
-        app->cap_overflow ? " OVF!" : "");
-    canvas_draw_str(canvas, 2, 45, line);
     if(app->capturing) {
-        // state line: REC (writing) / WAIT (gated, below trigger) + live level, and gate on/off
-        if(app->cap_gate)
+        if(app->cap_gate && app->cap_paused)
+            snprintf(line, sizeof(line), "signal below range (%d)", app->cap_rssi);
+        else
             snprintf(
                 line,
                 sizeof(line),
-                "%s %d>%d gate on",
-                app->cap_paused ? "WAIT" : "REC",
-                app->cap_rssi,
-                app->trigger);
-        else
-            snprintf(line, sizeof(line), "REC  %d dBm  gate off", app->cap_rssi);
-        canvas_draw_str(canvas, 2, 54, line);
+                "REC  %lu spl%s  %d dBm",
+                (unsigned long)app->cap_samples,
+                app->cap_overflow ? "!" : "",
+                app->cap_rssi);
     } else {
-        // idle: show the gate setting so the user knows before pressing Rec
-        snprintf(line, sizeof(line), "gate %s (Up/Dn)", app->cap_gate ? "on" : "off");
-        canvas_draw_str(canvas, 2, 54, line);
+        snprintf(line, sizeof(line), "RSSI filter: %s  (Up/Dn)", app->cap_gate ? "on" : "off");
     }
+    canvas_draw_str(canvas, 2, 45, line);
 
     if(app->capturing) {
         elements_button_center(canvas, "Stop");
