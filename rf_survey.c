@@ -16,6 +16,53 @@ extern const uint8_t subghz_device_cc1101_preset_ook_650khz_async_regs[];
 #define RSSI_FLOOR -100.0f
 #define RSSI_CEIL  -40.0f
 
+// Known sub-GHz allocations in the CC1101 range (EU/SE-centric). A detected peak is
+// tagged with the first matching band's short label, prefixed "~" = likely/potential.
+// Short on purpose so it fits the 128px screen. First match wins, so specific ISM
+// slots come before the catch-all SRD ranges.
+typedef struct {
+    uint32_t lo;
+    uint32_t hi;
+    const char* name;
+} FreqBand;
+
+static const FreqBand KNOWN_BANDS[] = {
+    // 300-348 MHz: mostly US/Asia remotes, garages, TPMS, car keys
+    {300000000, 303000000, "300 remote"},
+    {303000000, 305000000, "304 garage"}, // 303.875 / 304.25
+    {310000000, 312500000, "310 garage"},
+    {313000000, 316000000, "315 remote"}, // car/garage/TPMS
+    {317000000, 319500000, "318 garage"},
+    {329000000, 331000000, "330 car"},
+    {338000000, 346000000, "345 remote"},
+    {300000000, 348000000, "UHF remote"}, // catch-all low band
+    // 387-464 MHz: EU 433 ISM, PMR446, UK/EU remotes
+    {389000000, 391000000, "390 remote"},
+    {417000000, 419000000, "418 UK gate"},
+    {433050000, 434790000, "433 ISM"}, // keyfob/TPMS/weather/LoRa (433.92)
+    {438000000, 440000000, "433 ham"}, // 70cm amateur edge
+    {446000000, 446200000, "PMR446"}, // walkie-talkies
+    {387000000, 464000000, "UHF SRD"}, // catch-all mid band
+    // 779-928 MHz: EU 868 ISM, 800/900 cellular, US 915
+    {779000000, 787000000, "780 ISM"},
+    {791000000, 821000000, "LTE800 DL"}, // cell tower -> you
+    {832000000, 862000000, "LTE800 UL"}, // device -> tower (chase this)
+    {863000000, 868000000, "863 SRD"}, // EU SRD, audio/alarms
+    {868000000, 870000000, "868 ISM"}, // LoRa/Z-Wave/keyfob/meter (868.3)
+    {870000000, 876000000, "SRD 870"},
+    {876000000, 880000000, "GSM-R"}, // railway
+    {880000000, 915000000, "GSM900 UL"}, // mobile uplink
+    {915000000, 921000000, "900 ISM"}, // EU ext SRD / US LoRa 915
+    {921000000, 928000000, "GSM900 DL"}, // tower downlink (925-928)
+};
+
+static const char* band_name(uint32_t f) {
+    for(size_t i = 0; i < COUNT_OF(KNOWN_BANDS); i++) {
+        if(f >= KNOWN_BANDS[i].lo && f < KNOWN_BANDS[i].hi) return KNOWN_BANDS[i].name;
+    }
+    return NULL;
+}
+
 typedef struct {
     // scan config
     uint32_t f_start;
@@ -108,14 +155,27 @@ static void bars_draw(Canvas* canvas, void* model) {
         (unsigned long)app->sweeps);
     canvas_draw_str(canvas, 2, 8, hdr);
 
-    char pk[40];
-    snprintf(
-        pk,
-        sizeof(pk),
-        "%lu.%lu MHz  %d dBm",
-        (unsigned long)(pfreq / 1000000),
-        (unsigned long)((pfreq / 100000) % 10),
-        pmax);
+    char pk[48];
+    const char* bn = band_name(pfreq);
+    if(bn) {
+        // compact "<freq> <dBm> ~<likely band>" so the tag fits one 128px line
+        snprintf(
+            pk,
+            sizeof(pk),
+            "%lu.%lu %d ~%s",
+            (unsigned long)(pfreq / 1000000),
+            (unsigned long)((pfreq / 100000) % 10),
+            pmax,
+            bn);
+    } else {
+        snprintf(
+            pk,
+            sizeof(pk),
+            "%lu.%lu MHz  %d dBm",
+            (unsigned long)(pfreq / 1000000),
+            (unsigned long)((pfreq / 100000) % 10),
+            pmax);
+    }
     canvas_draw_str(canvas, 2, 18, pk);
 
     // bars: map each display column to a bin, show current + peak-hold dot
