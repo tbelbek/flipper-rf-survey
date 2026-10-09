@@ -816,6 +816,12 @@ static void draw_info(Canvas* canvas, uint32_t f, int dbm) {
 }
 
 static void draw_bars(Canvas* canvas, App* app, int floor, int ceil) {
+    // the Trigger IS the baseline: only signal that clears the floor draws a bar, and it gets the
+    // full height. Same floor the waterfall/haptic/history use. Keep the autoscaled top (>= floor+15
+    // so there's always a sane window when nothing is strong yet).
+    UNUSED(floor);
+    floor = app->trigger;
+    if(ceil < floor + 15) ceil = floor + 15;
     for(uint16_t k = 0; k < NBARS; k++) {
         int8_t cur, pk;
         grp_max(app, k, &cur, &pk);
@@ -825,13 +831,8 @@ static void draw_bars(Canvas* canvas, App* app, int floor, int ceil) {
         int ph = bar_h(pk, floor, ceil);
         if(ph > 0) canvas_draw_line(canvas, x, BASE_Y - ph, x + BAR_PITCH - 2, BASE_Y - ph);
     }
+    // solid baseline = the Trigger floor (bars rise from here; below it is nothing)
     canvas_draw_line(canvas, 0, BASE_Y + 1, SCR_W - 1, BASE_Y + 1);
-    // dotted trigger line: the floor that the waterfall/haptic use (where a bar clears it,
-    // that bin counts as "signal")
-    int th = bar_h(app->trigger, floor, ceil);
-    int ty = BASE_Y - th;
-    for(int x = 0; x < SCR_W; x += 4)
-        canvas_draw_dot(canvas, x, ty);
     // wide cursor frame around the selected grouped bar (the band you'd zoom into)
     int cx = (int)app->cursor * BAR_PITCH;
     if(cx < 1) cx = 1;
