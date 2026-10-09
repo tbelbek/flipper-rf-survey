@@ -9,9 +9,27 @@
 #include <storage/storage.h>
 #include <furi_hal_rtc.h>
 
-// CC1101 preset register tables are exported to apps; AM650 = wide OOK, good for a
-// broadband RSSI survey. (Same names the stock Spectrum Analyzer / SubGHz use.)
+// CC1101 preset register tables exported to apps. These set the RX filter bandwidth; the
+// survey preset is user-selectable in config (same four names the stock Spectrum Analyzer /
+// SubGHz use). AM650 (widest OOK) is the default -- best broadband energy pickup at wide steps.
 extern const uint8_t subghz_device_cc1101_preset_ook_650khz_async_regs[];
+extern const uint8_t subghz_device_cc1101_preset_ook_270khz_async_regs[];
+extern const uint8_t subghz_device_cc1101_preset_2fsk_dev2_38khz_async_regs[];
+extern const uint8_t subghz_device_cc1101_preset_2fsk_dev47_6khz_async_regs[];
+
+typedef struct {
+    const char* name;
+    const uint8_t* regs;
+} SurveyPreset;
+
+// available in both OFW (87.1) and Unleashed (88.9) SDKs
+static const SurveyPreset PRESETS[] = {
+    {"AM650", subghz_device_cc1101_preset_ook_650khz_async_regs},
+    {"AM270", subghz_device_cc1101_preset_ook_270khz_async_regs},
+    {"FM238", subghz_device_cc1101_preset_2fsk_dev2_38khz_async_regs},
+    {"FM476", subghz_device_cc1101_preset_2fsk_dev47_6khz_async_regs},
+};
+#define PRESET_N COUNT_OF(PRESETS)
 
 // A permissive region covering the three CC1101 bands, installed for the app's lifetime
 // (restored on exit). Receiving is legal everywhere; without this, out-of-"default-range"
@@ -70,6 +88,7 @@ static bool tune_rx(uint32_t f) {
 #define BAR_PITCH  (SCR_W / NBARS)
 #define RSSI_FLOOR -100.0f
 #define RSSI_CEIL  -40.0f
+#define CSV_BUF    512 // one FAT sector: CSV rows flush in chunks instead of a 5 KB line buffer
 
 // Known sub-GHz allocations across the whole CC1101 range (global: US/EU/JP/CN/ITU),
 // each with a typical modulation (AM = OOK, FM = 2-FSK). Used two ways: to tag a detected
@@ -158,7 +177,7 @@ typedef struct {
     uint32_t f_step;
     uint16_t nbins;
     uint8_t settle_ms;
-    Mod mod;
+    volatile uint8_t preset_idx; // index into PRESETS[]; worker reloads the CC1101 on change
     volatile bool reconfig; // config changed -> worker recomputes bins + resets buffers
 
     // scan data as int8 dBm (worker writes, GUI reads; per-byte loads/stores are
@@ -180,11 +199,11 @@ typedef struct {
     volatile uint8_t win_sec; // display window for connected/waterfall pages (5..60 s)
 
     // CSV logging. The worker owns the File*; the GUI (long-OK) only flips `recording`.
-    // Stopped on any reconfig so the fixed-column CSV never mixes two ranges. The line
-    // buffer lives here (heap) -- a 5 KB stack local would blow the 3 KB worker stack.
+    // Stopped on any reconfig so the fixed-column CSV never mixes two ranges. Rows flush in
+    // CSV_BUF chunks (one FAT sector) so this stays 512 B, not a 5 KB per-row line buffer.
     volatile bool recording;
     uint32_t rec_rows;
-    char csv_line[MAX_BINS * 5 + 32];
+    char csv_line[CSV_BUF];
 
     // spectrum UI state
     uint8_t page; // 0=bars 1=connected 2=waterfall 3=numeric
@@ -202,7 +221,7 @@ typedef struct {
     View* view; // spectrum
     VariableItemList* conf; // config screen
     VariableItem* it_range; // "Range MHz" readout, updated when a band is picked
-    VariableItem* it_mod; // "Mod" AM/FM
+    VariableItem* it_preset; // "Modulation" preset (AM650/AM270/FM238/FM476)
     FuriTimer* redraw;
 } App;
 
@@ -256,7 +275,7 @@ static File* csv_open(App* app, Storage* storage) {
     int n = snprintf(
         app->csv_line,
         sizeof(app->csv_line),
-        "# RF Survey\n# start=%lu end=%lu step=%lu nbins=%u settle=%u mod=%s\n"
+        "# RF Survey\n# start=%lu end=%lu step=%lu nbins=%u settle=%u preset=%s\n"
         "# rtc=%04u-%02u-%02u %02u:%02u:%02u\n"
         "# t_ms,bin0..bin%u (dBm; -128=invalid)  binfreq=start+idx*step\n",
         (unsigned long)app->f_start,
@@ -264,7 +283,7 @@ static File* csv_open(App* app, Storage* storage) {
         (unsigned long)app->f_step,
         app->nbins,
         app->settle_ms,
-        mod_str(app->mod),
+        PRESETS[app->preset_idx].name,
         dt.year,
         dt.month,
         dt.day,
@@ -283,18 +302,35 @@ static File* csv_open(App* app, Storage* storage) {
     return f;
 }
 
+// flush the pending CSV chunk; returns false on a short write (SD full/failing)
+static bool csv_flush(File* csv, const char* buf, int* off) {
+    if(*off == 0) return true;
+    bool ok = storage_file_write(csv, buf, *off) == (size_t)*off;
+    *off = 0;
+    return ok;
+}
+
 // ---- radio sweep worker ----------------------------------------------------
 
 static int32_t sweep_worker(void* ctx) {
     App* app = ctx;
-    FURI_LOG_I(TAG, "worker: start, reset+preset");
+    FURI_LOG_I(TAG, "worker: start, reset");
     furi_hal_subghz_reset();
-    furi_hal_subghz_load_custom_preset(subghz_device_cc1101_preset_ook_650khz_async_regs);
 
     Storage* storage = furi_record_open(RECORD_STORAGE);
     File* csv = NULL; // open while recording; owned entirely by this thread
+    uint8_t cur_preset = 0xFF; // force a load on the first iteration
 
     while(app->running) {
+        // (re)load the CC1101 preset when the user picks a different one in config
+        if(cur_preset != app->preset_idx) {
+            uint8_t p = app->preset_idx;
+            if(p >= PRESET_N) p = 0;
+            furi_hal_subghz_idle();
+            furi_hal_subghz_load_custom_preset(PRESETS[p].regs);
+            cur_preset = p;
+            FURI_LOG_I(TAG, "worker: preset -> %s", PRESETS[p].name);
+        }
         // apply a pending config change: recompute bins for the new range/step and
         // clear the buffers so stale readings from the old range don't linger
         if(app->reconfig) {
@@ -374,16 +410,22 @@ static int32_t sweep_worker(void* ctx) {
         if((app->sweeps & 0x0F) == 0)
             FURI_LOG_D(TAG, "worker: sweep %lu", (unsigned long)app->sweeps);
 
-        // log one CSV row for this sweep: "t_ms,rssi0,..,rssiN" (one write, buffered)
+        // log one CSV row for this sweep: "t_ms,rssi0,..,rssiN", flushed in CSV_BUF chunks
+        // (one FAT sector) so the row buffer stays 512 B instead of ~5 KB.
         if(csv) {
-            int cap = (int)sizeof(app->csv_line);
-            int off = snprintf(app->csv_line, cap, "%lu", (unsigned long)furi_get_tick());
-            for(uint16_t i = 0; i < app->nbins && off < cap - 8; i++)
-                off += snprintf(app->csv_line + off, cap - off, ",%d", app->rssi[i]);
-            if(off < cap - 1) app->csv_line[off++] = '\n';
-            size_t wr = storage_file_write(csv, app->csv_line, off);
-            if(wr != (size_t)off) { // SD full / failing -> stop cleanly, don't spin
-                FURI_LOG_E(TAG, "csv: short write %u/%d, stopping", (unsigned)wr, off);
+            int off = snprintf(app->csv_line, CSV_BUF, "%lu", (unsigned long)furi_get_tick());
+            bool ok = true;
+            for(uint16_t i = 0; i < app->nbins; i++) {
+                if(off > CSV_BUF - 8) { // keep room for the next ",-128" + newline
+                    if(!(ok = csv_flush(csv, app->csv_line, &off))) break;
+                }
+                off += snprintf(app->csv_line + off, CSV_BUF - off, ",%d", app->rssi[i]);
+            }
+            if(ok && off < CSV_BUF - 1) app->csv_line[off++] = '\n';
+            if(ok) ok = csv_flush(csv, app->csv_line, &off);
+            if(!ok) { // SD full / failing -> stop cleanly, don't spin
+                FURI_LOG_E(
+                    TAG, "csv: write failed, stopping at %lu rows", (unsigned long)app->rec_rows);
                 storage_file_close(csv);
                 storage_file_free(csv);
                 csv = NULL;
@@ -852,8 +894,7 @@ static void band_cb(VariableItem* item) {
     variable_item_set_current_value_text(item, b->name);
     app->f_start = b->lo;
     app->f_end = b->hi;
-    app->mod = b->mod;
-    app->reconfig = true;
+    app->reconfig = true; // range only; the preset is an independent manual choice
     FURI_LOG_I(
         TAG,
         "config: band[%u]=%s %lu-%lu",
@@ -861,7 +902,7 @@ static void band_cb(VariableItem* item) {
         b->name,
         (unsigned long)b->lo,
         (unsigned long)b->hi);
-    // reflect the chosen band into the range readout and the modulation item
+    // reflect the chosen band into the range readout
     char r[24];
     snprintf(
         r,
@@ -870,14 +911,15 @@ static void band_cb(VariableItem* item) {
         (unsigned long)(b->lo / 1000000),
         (unsigned long)(b->hi / 1000000));
     variable_item_set_current_value_text(app->it_range, r);
-    variable_item_set_current_value_index(app->it_mod, b->mod);
-    variable_item_set_current_value_text(app->it_mod, mod_str(b->mod));
 }
 
-static void mod_cb(VariableItem* item) {
+static void preset_cb(VariableItem* item) {
     App* app = variable_item_get_context(item);
-    app->mod = variable_item_get_current_value_index(item) ? ModFM : ModAM;
-    variable_item_set_current_value_text(item, mod_str(app->mod));
+    uint8_t idx = variable_item_get_current_value_index(item);
+    if(idx >= PRESET_N) idx = PRESET_N - 1;
+    app->preset_idx = idx; // worker reloads the CC1101 next loop
+    variable_item_set_current_value_text(item, PRESETS[idx].name);
+    app->reconfig = true; // changed measurement -> clear stale readings
 }
 
 static void step_cb(VariableItem* item) {
@@ -920,7 +962,7 @@ int32_t rf_survey_app(void* p) {
     app->f_end = 928000000;
     app->f_step = 650000;
     app->settle_ms = 3;
-    app->mod = ModFM; // matches the default "Full high" band preset
+    app->preset_idx = 0; // AM650: widest OOK filter, best broadband survey pickup
     app->cursor = NBARS / 2;
     app->win_sec = 60; // default time window (max)
     // defensive against bad config (future editable ranges): never div-by-zero,
@@ -952,16 +994,16 @@ int32_t rf_survey_app(void* p) {
     view_dispatcher_add_view(app->vd, VIEW_SPEC, app->view);
 
     // config view (VariableItemList): pick a band preset (full spectrum / full band /
-    // known allocation) -> fills range + AM/FM; also Range readout, Mod and Step. OK scans.
+    // known allocation) -> fills range; also Range readout, Modulation preset and Step. OK scans.
     app->conf = variable_item_list_alloc();
     VariableItem* vi = variable_item_list_add(app->conf, "Band", PRESET_COUNT, band_cb, app);
     variable_item_set_current_value_index(vi, 3); // default "Full high" (779-928)
     variable_item_set_current_value_text(vi, preset_at(3)->name);
     app->it_range = variable_item_list_add(app->conf, "Range MHz", 1, NULL, app);
     variable_item_set_current_value_text(app->it_range, "779-928");
-    app->it_mod = variable_item_list_add(app->conf, "Mod", 2, mod_cb, app);
-    variable_item_set_current_value_index(app->it_mod, app->mod);
-    variable_item_set_current_value_text(app->it_mod, mod_str(app->mod));
+    app->it_preset = variable_item_list_add(app->conf, "Modulation", PRESET_N, preset_cb, app);
+    variable_item_set_current_value_index(app->it_preset, app->preset_idx);
+    variable_item_set_current_value_text(app->it_preset, PRESETS[app->preset_idx].name);
     vi = variable_item_list_add(app->conf, "Step", COUNT_OF(STEP_HZ), step_cb, app);
     variable_item_set_current_value_index(vi, 4); // 650k
     variable_item_set_current_value_text(vi, "650k");
