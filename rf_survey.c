@@ -61,7 +61,9 @@ static bool tune_rx(uint32_t f) {
 #define BASE_Y     50 // spectrum baseline (room for pill buttons below)
 #define MAX_H      28 // tallest bar
 #define BODY_Y0    22 // top of the page body
-#define HIST_ROWS  28 // waterfall history depth (1px per sweep)
+#define WF_ROWS    40 // waterfall freq rows (full-bleed height)
+#define WF_COLS    120 // waterfall time columns: one per completed sweep, ring
+#define WF_H       54 // waterfall pixel height (y 0..53, above the pills)
 #define NBARS      32 // thick grouped bars (4px pitch) -> easy cursor stepping
 #define BAR_PITCH  (SCR_W / NBARS)
 #define RSSI_FLOOR -100.0f
@@ -163,13 +165,20 @@ typedef struct {
     int8_t peak[MAX_BINS];
     uint32_t sweeps;
 
-    // waterfall history: one downsampled (col-max) int8 row per finished sweep, ring buffer
-    int8_t hist[HIST_ROWS][SCR_W];
-    uint8_t hist_head;
-    uint8_t hist_count;
+    // waterfall: one column per completed sweep (1024 bins max-folded to WF_ROWS freq rows),
+    // ring over time. col_ms stamps each column's wall-clock (ms) so both new pages window by
+    // real time, not sweep count. col_thr freezes the lit/unlit threshold at capture time so
+    // old columns don't re-threshold (flicker) under a moving autoscale. (col_ms/col_thr are
+    // not byte-atomic, but a torn read only mis-windows one column -> cosmetic, like rssi[].)
+    int8_t wf[WF_ROWS][WF_COLS];
+    int8_t col_thr[WF_COLS];
+    uint32_t col_ms[WF_COLS];
+    uint8_t wf_head;
+    uint8_t wf_count;
+    volatile uint8_t win_sec; // display window for connected/waterfall pages (5..60 s)
 
     // spectrum UI state
-    uint8_t page; // 0=bars 1=waterfall 2=numeric
+    uint8_t page; // 0=bars 1=connected 2=waterfall 3=numeric
     uint16_t cursor; // bars cursor column (framed); OK zooms into it
     struct {
         uint32_t s, e, st;
@@ -190,20 +199,19 @@ typedef struct {
 
 static App* g_app;
 
-// max rssi/peak over the bins that map to display column px (shared by the bars draw
-// and the waterfall row builder so both downsample the same way)
-static void col_max(const App* app, int px, int8_t* cur, int8_t* pk) {
-    uint32_t b0 = (uint32_t)px * app->nbins / SCR_W;
-    uint32_t b1 = (uint32_t)(px + 1) * app->nbins / SCR_W;
+static void autoscale(const App* app, int* floor, int* ceil); // used by the worker too
+
+// max rssi over the bins that map to waterfall freq-row r (frequency fold is always max,
+// never average -- a narrow burst must not wash out).
+static int8_t wf_row_max(const App* app, int r) {
+    uint32_t b0 = (uint32_t)r * app->nbins / WF_ROWS;
+    uint32_t b1 = (uint32_t)(r + 1) * app->nbins / WF_ROWS;
     if(b1 <= b0) b1 = b0 + 1;
     if(b1 > app->nbins) b1 = app->nbins;
-    int8_t c = -128, p = -128;
-    for(uint32_t b = b0; b < b1; b++) {
-        if(app->rssi[b] > c) c = app->rssi[b];
-        if(app->peak[b] > p) p = app->peak[b];
-    }
-    *cur = c;
-    *pk = p;
+    int8_t m = -128;
+    for(uint32_t b = b0; b < b1; b++)
+        if(app->rssi[b] > m) m = app->rssi[b];
+    return m;
 }
 
 // ---- radio sweep worker ----------------------------------------------------
@@ -227,8 +235,10 @@ static int32_t sweep_worker(void* ctx) {
                 app->peak[i] = -128;
             }
             app->sweeps = 0;
-            app->hist_head = 0;
-            app->hist_count = 0; // waterfall history is per-range
+            app->wf_head = 0;
+            app->wf_count = 0;
+            memset(app->wf, -128, sizeof(app->wf)); // waterfall history is per-range
+            memset(app->col_ms, 0, sizeof(app->col_ms));
             app->reconfig = false;
             FURI_LOG_I(
                 TAG,
@@ -250,15 +260,20 @@ static int32_t sweep_worker(void* ctx) {
             app->rssi[i] = r;
             if(r > app->peak[i]) app->peak[i] = r;
         }
-        // push a downsampled row into the waterfall ring
-        int8_t* row = app->hist[app->hist_head];
-        for(int px = 0; px < SCR_W; px++) {
-            int8_t c, p;
-            col_max(app, px, &c, &p);
-            row[px] = c;
+        // commit this sweep as one waterfall column: max-fold the bins to WF_ROWS freq rows,
+        // freeze a lit threshold from the current autoscale, timestamp it (one col == one sweep,
+        // so the real time resolution is the sweep period -- honest, no fabricated sub-bins).
+        {
+            int fl, ce;
+            autoscale(app, &fl, &ce);
+            uint8_t h = (uint8_t)((app->wf_head + 1) % WF_COLS);
+            for(int r = 0; r < WF_ROWS; r++)
+                app->wf[r][h] = wf_row_max(app, r);
+            app->col_thr[h] = (int8_t)(fl + (ce - fl) * 3 / 10);
+            app->col_ms[h] = furi_get_tick();
+            app->wf_head = h;
+            if(app->wf_count < WF_COLS) app->wf_count++;
         }
-        app->hist_head = (uint8_t)((app->hist_head + 1) % HIST_ROWS);
-        if(app->hist_count < HIST_ROWS) app->hist_count++;
         app->sweeps++;
         if((app->sweeps & 0x0F) == 0)
             FURI_LOG_D(TAG, "worker: sweep %lu", (unsigned long)app->sweeps);
@@ -414,22 +429,94 @@ static void draw_bars(Canvas* canvas, App* app, int floor, int ceil) {
     canvas_draw_frame(canvas, cx - 1, BODY_Y0 - 2, BAR_PITCH + 1, BASE_Y - BODY_Y0 + 3);
 }
 
-// Persistence spectrum: for each frequency column, a solid bar whose height = the fraction
-// of the last N sweeps that column was active (above threshold). A constant transmitter is
-// a full bar, an intermittent/bursty one a partial bar, silence is empty. Crisp in 1-bit
-// (no dither needed) and the right view for "is a signal appearing over time".
-static void draw_persistence(Canvas* canvas, App* app, int floor, int ceil) {
-    int thr = floor + (ceil - floor) * 3 / 10;
-    int n = app->hist_count ? app->hist_count : 1;
-    for(int px = 0; px < SCR_W; px++) {
-        int cnt = 0;
-        for(uint8_t r = 0; r < app->hist_count && r < HIST_ROWS; r++) {
-            if(app->hist[r][px] > thr) cnt++;
+// avg + peak of waterfall freq-row r over the columns captured within the last win_sec.
+// One column == one sweep, so the mean of those columns IS the true per-sweep window mean
+// (no "average of per-slot maxima" fudge); peak = max over the same columns.
+static void wf_window_stats(const App* app, int r, uint32_t now, int* avg, int8_t* pk) {
+    uint32_t win_ms = (uint32_t)app->win_sec * 1000;
+    int sum = 0, cnt = 0;
+    int8_t p = -128;
+    for(int c = 0; c < WF_COLS; c++) {
+        uint32_t cm = app->col_ms[c];
+        if(cm == 0 || now - cm > win_ms) continue; // unwritten or outside the window
+        int8_t v = app->wf[r][c];
+        if(v == -128) continue; // band gap / invalid
+        sum += v;
+        cnt++;
+        if(v > p) p = v;
+    }
+    *avg = cnt ? sum / cnt : -128;
+    *pk = p;
+}
+
+// Connected page: per-frequency AVERAGE over the window as a solid polyline, plus the window
+// peak as a dotted envelope above it. "Is this frequency consistently there, and how hot does
+// it get?" -- a steadier read than the instantaneous bars.
+static void draw_connected(Canvas* canvas, App* app, int floor, int ceil) {
+    uint32_t now = furi_get_tick();
+    int px_prev = -1, y_prev = 0;
+    for(int r = 0; r < WF_ROWS; r++) {
+        int avg;
+        int8_t pk;
+        wf_window_stats(app, r, now, &avg, &pk);
+        int x = r * (SCR_W - 1) / (WF_ROWS - 1);
+        if(avg > -128) {
+            int y = BASE_Y - bar_h(avg, floor, ceil);
+            if(px_prev >= 0) canvas_draw_line(canvas, px_prev, y_prev, x, y);
+            px_prev = x;
+            y_prev = y;
+        } else {
+            px_prev = -1; // break the line across a gap
         }
-        int h = cnt * MAX_H / n;
-        if(h > 0) canvas_draw_line(canvas, px, BASE_Y, px, BASE_Y - h);
+        if(pk > -128) canvas_draw_dot(canvas, x, BASE_Y - bar_h(pk, floor, ceil));
     }
     canvas_draw_line(canvas, 0, BASE_Y + 1, SCR_W - 1, BASE_Y + 1);
+}
+
+// Horizontal waterfall: X = time (oldest left, newest right), Y = frequency (start at top,
+// end at bottom). Full-bleed above the pills. A cell is lit if that sweep's row cleared the
+// threshold frozen when the column was captured. Columns are placed by real timestamp over
+// the last win_sec, nearest-earlier sample per screen x -> fills width honestly (repeats a
+// real sweep when sweeps are slower than 1px, never invents sub-sweep detail). Shows WHEN a
+// band is busy and the spacing of bursts. Edge labels give the range; center gives the span.
+static void draw_waterfall(Canvas* canvas, App* app) {
+    uint32_t newest = app->col_ms[app->wf_head];
+    if(newest) {
+        uint32_t span = (uint32_t)app->win_sec * 1000;
+        uint32_t oldest = (newest > span) ? newest - span : 0;
+        for(int x = 0; x < SCR_W; x++) {
+            uint32_t t = oldest + (uint32_t)((uint64_t)(newest - oldest) * x / (SCR_W - 1));
+            int best = -1;
+            uint32_t bestt = 0;
+            for(int c = 0; c < WF_COLS; c++) {
+                uint32_t cm = app->col_ms[c];
+                if(cm == 0 || cm > t) continue;
+                if(best < 0 || cm > bestt) {
+                    best = c;
+                    bestt = cm;
+                }
+            }
+            if(best < 0) continue;
+            for(int r = 0; r < WF_ROWS; r++) {
+                if(app->wf[r][best] > app->col_thr[best]) {
+                    int y0 = r * WF_H / WF_ROWS;
+                    int y1 = (r + 1) * WF_H / WF_ROWS;
+                    if(y1 <= y0) y1 = y0 + 1;
+                    canvas_draw_box(canvas, x, y0, 1, y1 - y0);
+                }
+            }
+        }
+    }
+    // labels over the heatmap in XOR so they stay readable on lit or dark areas
+    char s[12];
+    canvas_set_color(canvas, ColorXOR);
+    snprintf(s, sizeof(s), "%lu", (unsigned long)(app->f_start / 1000000));
+    canvas_draw_str(canvas, 1, 8, s); // top edge = start freq
+    snprintf(s, sizeof(s), "%lu", (unsigned long)(app->f_end / 1000000));
+    canvas_draw_str(canvas, 1, WF_H - 1, s); // bottom edge = end freq
+    snprintf(s, sizeof(s), "%us", (unsigned)app->win_sec);
+    canvas_draw_str_aligned(canvas, 64, WF_H / 2, AlignCenter, AlignCenter, s); // center = window
+    canvas_set_color(canvas, ColorBlack);
 }
 
 // Numeric page: 4 full-width horizontal bars (precise top-4 bins). Bar length ~ strength;
@@ -490,7 +577,7 @@ static void spectrum_draw(Canvas* canvas, void* model) {
     canvas_clear(canvas);
     canvas_set_font(canvas, FontSecondary);
 
-    if(app->page == 2) {
+    if(app->page == 3) {
         // numeric fills the whole screen; show the locked range by the pills
         draw_numeric(canvas, app);
         char r[24];
@@ -501,20 +588,32 @@ static void spectrum_draw(Canvas* canvas, void* model) {
             (unsigned long)(app->f_start / 1000000),
             (unsigned long)(app->f_end / 1000000));
         canvas_draw_str_aligned(canvas, 64, 62, AlignCenter, AlignBottom, r);
+    } else if(app->page == 2) {
+        draw_waterfall(canvas, app); // full-bleed, carries its own range + span labels
     } else {
-        // header: range + likely band name for the range center
+        // header: range + likely band name (+ window seconds on the connected page)
         uint32_t fc = app->f_start / 2 + app->f_end / 2;
         const FreqBand* hb = band_lookup(fc);
-        char hdr[40];
-        snprintf(
-            hdr,
-            sizeof(hdr),
-            "%lu-%lu %s",
-            (unsigned long)(app->f_start / 1000000),
-            (unsigned long)(app->f_end / 1000000),
-            hb ? hb->name : "");
+        char hdr[48];
+        if(app->page == 1)
+            snprintf(
+                hdr,
+                sizeof(hdr),
+                "%lu-%lu %s %us",
+                (unsigned long)(app->f_start / 1000000),
+                (unsigned long)(app->f_end / 1000000),
+                hb ? hb->name : "",
+                (unsigned)app->win_sec);
+        else
+            snprintf(
+                hdr,
+                sizeof(hdr),
+                "%lu-%lu %s",
+                (unsigned long)(app->f_start / 1000000),
+                (unsigned long)(app->f_end / 1000000),
+                hb ? hb->name : "");
         canvas_draw_str(canvas, 2, 8, hdr);
-        // info line: cursor readout on bars, global peak on waterfall
+        // info line: cursor readout on bars, global peak on connected
         if(app->page == 0) {
             int8_t cur, pk;
             grp_max(app, app->cursor, &cur, &pk);
@@ -535,7 +634,7 @@ static void spectrum_draw(Canvas* canvas, void* model) {
         if(app->page == 0)
             draw_bars(canvas, app, floor, ceil);
         else
-            draw_persistence(canvas, app, floor, ceil);
+            draw_connected(canvas, app, floor, ceil);
     }
 
     // native pill hints
@@ -563,7 +662,7 @@ static bool spectrum_input(InputEvent* event, void* context) {
         if(sp && app->page == 0 && app->cursor > 0)
             app->cursor--; // move cursor
         else
-            app->page = (uint8_t)((app->page + 2) % 3); // edge / long -> prev page
+            app->page = (uint8_t)((app->page + 3) % 4); // edge / long -> prev page
         spec_redraw(app);
         return true;
     }
@@ -571,7 +670,18 @@ static bool spectrum_input(InputEvent* event, void* context) {
         if(sp && app->page == 0 && app->cursor < NBARS - 1)
             app->cursor++;
         else
-            app->page = (uint8_t)((app->page + 1) % 3); // edge / long -> next page
+            app->page = (uint8_t)((app->page + 1) % 4); // edge / long -> next page
+        spec_redraw(app);
+        return true;
+    }
+    // Up/Down set the connected/waterfall time window (5..60 s)
+    if(event->key == InputKeyUp && sp) {
+        if(app->win_sec <= 55) app->win_sec += 5;
+        spec_redraw(app);
+        return true;
+    }
+    if(event->key == InputKeyDown && sp) {
+        if(app->win_sec >= 10) app->win_sec -= 5;
         spec_redraw(app);
         return true;
     }
@@ -672,6 +782,7 @@ int32_t rf_survey_app(void* p) {
     app->settle_ms = 3;
     app->mod = ModFM; // matches the default "Full high" band preset
     app->cursor = NBARS / 2;
+    app->win_sec = 60; // default time window (max)
     // defensive against bad config (future editable ranges): never div-by-zero,
     // never an inverted range, always 1..MAX_BINS bins, and keep f_end consistent
     // with the bins actually scanned so the axis labels can't lie.
