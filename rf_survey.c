@@ -521,6 +521,9 @@ static int32_t sweep_worker(void* ctx) {
     Storage* storage = furi_record_open(RECORD_STORAGE);
     File* csv = NULL; // open while recording; owned entirely by this thread
     uint8_t cur_preset = 0xFF, cur_gain = 0xFF, cur_bw = 0x00; // force a load on the first loop
+    uint32_t hap_last =
+        0; // last locate-haptic sample time; persists across sweeps (not per-sweep,
+        // or a short zoomed sweep would resample every bin instead of every 30 ms)
 
     while(app->running) {
         // (re)load the CC1101 preset on a preset/gain change OR a zoom bandwidth change. When
@@ -593,10 +596,11 @@ static int32_t sweep_worker(void* ctx) {
         uint32_t fs = app->f_start, st = app->f_step;
         int8_t smax = -128; // this sweep's strongest bin + its index (haptic + history)
         uint16_t smaxi = 0;
-        uint32_t hap_last = 0; // last time we sampled the selected freq for the locate haptic
+        uint16_t valid = 0; // bins actually measured this sweep (0 -> range is all band-gap)
         for(uint16_t i = 0; i < app->nbins && app->running; i++) {
             uint32_t f = fs + (uint32_t)i * st;
             if(furi_hal_subghz_is_frequency_valid(f) && tune_rx(f)) {
+                valid++;
                 furi_delay_ms(app->settle_ms);
                 float rf = furi_hal_subghz_get_rssi();
                 int8_t r = (rf < -127.0f) ? (int8_t)-127 : (int8_t)rf; // keep -128 as the sentinel
@@ -630,12 +634,15 @@ static int32_t sweep_worker(void* ctx) {
                 }
                 haptic_pump(app, furi_get_tick());
             } else if(app->hap_on) {
-                // spectrum was left (or haptic disabled) while a pulse was latched on -- release it.
-                // spec_exit also calls haptic_off, but this worker thread can re-arm the motor in a
-                // check-then-act race after that; releasing here guarantees it can't stay stuck on.
+                // spectrum left or haptic disabled while a pulse was latched on -> release it here.
+                // This worker is the SOLE owner of the motor (spec_exit only clears spec_active), so
+                // there is no cross-thread write to race and the motor can never stay stuck on.
                 haptic_off(app);
             }
         }
+        // an all-band-gap range (e.g. a custom 350-360 MHz) measures zero bins and would otherwise
+        // spin this loop at 100% CPU with no settle delay -- back off so it can't busy-wait.
+        if(!valid && app->running) furi_delay_ms(80);
         // commit this sweep as one waterfall column: max-fold the bins to WF_ROWS freq rows,
         // timestamp it (one col == one sweep, so the real time resolution is the sweep period
         // -- honest, no fabricated sub-bins). The lit cut is the user Trigger, applied at draw.
@@ -1281,8 +1288,11 @@ static void spec_enter(void* ctx) {
 }
 static void spec_exit(void* ctx) {
     App* app = ctx;
+    // ONLY publish the flag. The sweep worker is the sole owner of the vibro motor + haptic state;
+    // it releases the motor on the next bin once it sees spec_active is false (see the else branch
+    // in the sweep loop). Touching hap_on/the motor from this GUI thread races the worker and can
+    // latch the motor ON (worker turns it on between our hap_on read and write).
     app->spec_active = false;
-    haptic_off(app); // leaving the spectrum -> release the motor, reset the filter
 }
 
 // ---- custom range editor (VIEW_RANGE) --------------------------------------
@@ -1454,6 +1464,12 @@ static int32_t capture_worker(void* ctx) {
              flipper_format_write_string_cstr(ff, "Preset", ps->sub) &&
              flipper_format_write_string_cstr(ff, "Protocol", "RAW");
     }
+    if(ok && !furi_hal_subghz_is_frequency_valid(app->cap_freq)) {
+        // belt-and-suspenders: the input handler already blocks tuning into a band gap, but never
+        // hand the HAL an unsupported frequency -- set_frequency can furi_crash on a gap.
+        FURI_LOG_E(TAG, "cap: invalid frequency %lu", (unsigned long)app->cap_freq);
+        ok = false;
+    }
     if(!ok) {
         FURI_LOG_E(TAG, "cap: open/header failed %s", path);
         app->capturing = false;
@@ -1490,6 +1506,8 @@ static int32_t capture_worker(void* ctx) {
                 if(app->haptic && app->notif) {
                     haptic_sample(app, app->cap_rssi);
                     haptic_pump(app, now);
+                } else if(app->hap_on) {
+                    haptic_off(app); // symmetry with the sweep loop: never leave a pulse latched
                 }
             }
             int32_t d;
@@ -1646,13 +1664,16 @@ static bool capture_input(InputEvent* e, void* ctx) {
         else
             app->cap_preset = (uint8_t)((app->cap_preset + PRESET_N - 1) % PRESET_N);
     } else if(!app->capturing && sp && (e->key == InputKeyUp || e->key == InputKeyDown)) {
-        // Up/Down: fine-tune the capture frequency by 10 kHz, clamped to the CC1101 range
+        // Up/Down: fine-tune the capture frequency by 10 kHz, clamped to the CC1101 range. Only
+        // accept a step that lands on a HAL-valid frequency, so you can't tune into a band gap
+        // (348-387 / 464-779 MHz) -- capture would otherwise pick the wrong path and feed the HAL
+        // an unsupported frequency.
         uint32_t f = app->cap_freq;
         if(e->key == InputKeyUp)
             f = (f <= 928000000 - 10000) ? f + 10000 : 928000000;
         else
             f = (f >= 300000000 + 10000) ? f - 10000 : 300000000;
-        app->cap_freq = f;
+        if(furi_hal_subghz_is_frequency_valid(f)) app->cap_freq = f;
     } else {
         return true;
     }
