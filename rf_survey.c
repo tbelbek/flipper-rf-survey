@@ -241,8 +241,9 @@ typedef struct {
     char csv_line[CSV_BUF];
 
     // spectrum UI state
-    uint8_t page; // 0=bars 1=connected 2=waterfall 3=numeric
+    uint8_t page; // 0=bars 1=connected 2=waterfall 3=numeric 4=history
     uint16_t cursor; // bars cursor column (framed); OK zooms into it
+    uint8_t num_sel; // numeric page: which of the top-4 is selected (OK captures it)
     struct {
         uint32_t s, e, st;
     } zstack[4]; // zoom-out stack (previous ranges)
@@ -835,27 +836,64 @@ static void draw_waterfall(Canvas* canvas, App* app) {
     canvas_draw_str_aligned(canvas, SCR_W - 1, 62, AlignRight, AlignBottom, w);
 }
 
-// Numeric page: 4 full-width horizontal bars (precise top-4 bins). Bar length ~ strength;
-// the "<freq> <dBm> ~<band>" label is drawn in XOR so it reads black on the empty part and
-// white over the filled part. Fills the whole screen; the locked range sits by the pills.
-static void draw_numeric(Canvas* canvas, App* app) {
-    int tv[4] = {-200, -200, -200, -200};
-    uint16_t tb[4] = {0}; // precise top-4 bins
+// the 4 strongest DISTINCT peaks (descending), tv=dBm tb=bin index. Shared by the numeric
+// page and the capture entry so OK captures exactly the slot the cursor is on. Bins within
+// GROUP_HZ are treated as one peak (a single transmitter leaks across adjacent bins -- the
+// CC1101 RX filter is 270-650 kHz wide, so sub-MHz-apart bins are the same signal), keeping
+// only the strongest so the list shows 4 real signals, not 4 slices of one.
+#define GROUP_HZ 400000u
+static void numeric_top4(const App* app, int tv[4], uint16_t tb[4]) {
+    tv[0] = tv[1] = tv[2] = tv[3] = -200;
+    tb[0] = tb[1] = tb[2] = tb[3] = 0;
     for(uint16_t i = 0; i < app->nbins; i++) {
         int v = app->rssi[i];
         if(v <= -128) continue;
+        uint32_t fi = app->f_start + (uint32_t)i * app->f_step;
+        int grp = -1; // same-peak slot, if any
         for(int m = 0; m < 4; m++) {
-            if(v > tv[m]) {
-                for(int j = 3; j > m; j--) {
-                    tv[j] = tv[j - 1];
-                    tb[j] = tb[j - 1];
-                }
-                tv[m] = v;
-                tb[m] = i;
+            if(tv[m] <= -200) continue;
+            uint32_t fm = app->f_start + (uint32_t)tb[m] * app->f_step;
+            uint32_t d = (fi > fm) ? (fi - fm) : (fm - fi);
+            if(d < GROUP_HZ) {
+                grp = m;
                 break;
             }
         }
+        if(grp >= 0) {
+            if(v > tv[grp]) { // stronger sample of a peak we already have
+                tv[grp] = v;
+                tb[grp] = i;
+            }
+            continue;
+        }
+        int mn = 0; // no group -> replace the weakest slot if this is stronger
+        for(int m = 1; m < 4; m++)
+            if(tv[m] < tv[mn]) mn = m;
+        if(v > tv[mn]) {
+            tv[mn] = v;
+            tb[mn] = i;
+        }
     }
+    // sort the 4 descending (tiny)
+    for(int a = 0; a < 4; a++)
+        for(int b = a + 1; b < 4; b++)
+            if(tv[b] > tv[a]) {
+                int t = tv[a];
+                tv[a] = tv[b];
+                tv[b] = t;
+                uint16_t u = tb[a];
+                tb[a] = tb[b];
+                tb[b] = u;
+            }
+}
+
+// Numeric page: 4 full-width horizontal bars (precise top-4 bins). Bar length ~ strength;
+// the "<freq> <dBm> ~<band>" label is drawn in XOR so it reads black on the empty part and
+// white over the filled part. The cursor row (Up/Down) is bracketed; OK captures it.
+static void draw_numeric(Canvas* canvas, App* app) {
+    int tv[4];
+    uint16_t tb[4];
+    numeric_top4(app, tv, tb);
     int floor, ceil;
     autoscale(app, &floor, &ceil);
     const int pitch = 12, bh = 10;
@@ -863,26 +901,32 @@ static void draw_numeric(Canvas* canvas, App* app) {
         int y = 1 + k * pitch;
         if(tv[k] <= -200) {
             canvas_draw_frame(canvas, 0, y, SCR_W, bh); // empty slot outline
-            continue;
+        } else {
+            uint32_t f = app->f_start + (uint32_t)tb[k] * app->f_step;
+            int len = (tv[k] - floor) * SCR_W / ((ceil > floor) ? (ceil - floor) : 1);
+            if(len < 2) len = 2;
+            if(len > SCR_W) len = SCR_W;
+            canvas_draw_box(canvas, 0, y, len, bh);
+            const FreqBand* b = band_lookup(f);
+            char s[36];
+            snprintf(
+                s,
+                sizeof(s),
+                "%lu.%03lu  %d  %s",
+                (unsigned long)(f / 1000000),
+                (unsigned long)((f / 1000) % 1000),
+                tv[k],
+                b ? b->name : "");
+            canvas_set_color(canvas, ColorXOR); // reverse over the filled part, normal over empty
+            canvas_draw_str(canvas, 3, y + bh - 2, s);
+            canvas_set_color(canvas, ColorBlack);
         }
-        uint32_t f = app->f_start + (uint32_t)tb[k] * app->f_step;
-        int len = (tv[k] - floor) * SCR_W / ((ceil > floor) ? (ceil - floor) : 1);
-        if(len < 2) len = 2;
-        if(len > SCR_W) len = SCR_W;
-        canvas_draw_box(canvas, 0, y, len, bh);
-        const FreqBand* b = band_lookup(f);
-        char s[36];
-        snprintf(
-            s,
-            sizeof(s),
-            "%lu.%03lu  %d  %s",
-            (unsigned long)(f / 1000000),
-            (unsigned long)((f / 1000) % 1000),
-            tv[k],
-            b ? b->name : "");
-        canvas_set_color(canvas, ColorXOR); // reverse over the filled part, normal over empty
-        canvas_draw_str(canvas, 3, y + bh - 2, s);
-        canvas_set_color(canvas, ColorBlack);
+        // cursor bracket around the selected slot (the one OK will capture), in the 2px gaps
+        if(k == app->num_sel) {
+            canvas_draw_line(canvas, 0, y - 1, SCR_W - 1, y - 1);
+            canvas_draw_line(canvas, 0, y + bh, SCR_W - 1, y + bh);
+            canvas_draw_line(canvas, SCR_W - 1, y - 1, SCR_W - 1, y + bh);
+        }
     }
 }
 
@@ -929,16 +973,7 @@ static void spectrum_draw(Canvas* canvas, void* model) {
     canvas_set_font(canvas, FontSecondary);
 
     if(app->page == 3) {
-        // numeric fills the whole screen; show the locked range by the pills
-        draw_numeric(canvas, app);
-        char r[24];
-        snprintf(
-            r,
-            sizeof(r),
-            "%lu-%lu",
-            (unsigned long)(app->f_start / 1000000),
-            (unsigned long)(app->f_end / 1000000));
-        canvas_draw_str_aligned(canvas, 64, 62, AlignCenter, AlignBottom, r);
+        draw_numeric(canvas, app); // bars show absolute freqs; the Capture pill is below
     } else if(app->page == 2) {
         draw_waterfall(canvas, app); // full-bleed, carries its own range + span labels
     } else if(app->page == 4) {
@@ -996,6 +1031,7 @@ static void spectrum_draw(Canvas* canvas, void* model) {
     if(app->page != 2) {
         elements_button_left(canvas, "Page");
         if(app->page == 0) elements_button_center(canvas, "Zoom");
+        if(app->page == 3) elements_button_center(canvas, "Capture"); // OK on the cursor row
         if(app->zdepth) elements_button_right(canvas, "Out");
     }
 
@@ -1044,14 +1080,20 @@ static bool spectrum_input(InputEvent* event, void* context) {
         spec_redraw(app);
         return true;
     }
-    // Up/Down cycle the connected/waterfall time window (5 s .. 10 min)
+    // Up/Down: move the capture cursor on the numeric page, else cycle the time window
     if(event->key == InputKeyUp && sp) {
-        if(app->win_idx < (uint8_t)(WIN_N - 1)) app->win_idx++;
+        if(app->page == 3)
+            app->num_sel = (uint8_t)((app->num_sel + 3) % 4);
+        else if(app->win_idx < (uint8_t)(WIN_N - 1))
+            app->win_idx++;
         spec_redraw(app);
         return true;
     }
     if(event->key == InputKeyDown && sp) {
-        if(app->win_idx > 0) app->win_idx--;
+        if(app->page == 3)
+            app->num_sel = (uint8_t)((app->num_sel + 1) % 4);
+        else if(app->win_idx > 0)
+            app->win_idx--;
         spec_redraw(app);
         return true;
     }
@@ -1067,23 +1109,19 @@ static bool spectrum_input(InputEvent* event, void* context) {
         return true;
     }
     if(event->key == InputKeyOk && sp && app->page == 3) {
-        // numeric page: lock the strongest bin and open the .sub capture screen. Stop the
-        // survey worker first (from this input thread, never the draw cb) so the one radio
-        // has a single owner.
-        int pmax = -200;
-        uint16_t pidx = 0;
-        for(uint16_t i = 0; i < app->nbins; i++)
-            if(app->rssi[i] > pmax) {
-                pmax = app->rssi[i];
-                pidx = i;
-            }
-        if(pmax <= -128) return true; // nothing to capture
+        // numeric page: lock the SELECTED top-4 bin (Up/Down cursor) and open .sub capture.
+        // Stop the survey worker first (from this input thread, never the draw cb) so the one
+        // radio has a single owner.
+        int tv[4];
+        uint16_t tb[4];
+        numeric_top4(app, tv, tb);
+        if(tv[app->num_sel] <= -200) return true; // empty slot -> nothing to capture
         app->recording = false; // the survey worker will close any open CSV as it stops
         app->running = false;
         furi_thread_join(app->worker);
         furi_thread_free(app->worker);
         app->worker = NULL;
-        app->cap_freq = app->f_start + (uint32_t)pidx * app->f_step;
+        app->cap_freq = app->f_start + (uint32_t)tb[app->num_sel] * app->f_step;
         app->cap_preset = app->preset_idx;
         app->capturing = false;
         app->cap_samples = 0;
