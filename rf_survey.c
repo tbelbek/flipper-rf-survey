@@ -244,6 +244,7 @@ typedef struct {
     uint8_t page; // 0=bars 1=connected 2=waterfall 3=numeric 4=history
     uint16_t cursor; // bars cursor column (framed); OK zooms into it
     uint8_t num_sel; // numeric page: which of the top-4 is selected (OK captures it)
+    volatile bool spec_active; // true only while the spectrum view is shown (gates the haptic)
     struct {
         uint32_t s, e, st;
     } zstack[4]; // zoom-out stack (previous ranges)
@@ -423,6 +424,14 @@ static const uint8_t* preset_regs(App* app, uint8_t p, uint8_t gain, uint8_t bwn
     return app->preset_buf;
 }
 
+// a short, light vibro tick for the locate cue (~10 ms, lighter than sequence_single_vibro)
+static const NotificationSequence seq_vibro_tick = {
+    &message_vibro_on,
+    &message_delay_10,
+    &message_vibro_off,
+    NULL,
+};
+
 // ---- radio sweep worker ----------------------------------------------------
 
 static int32_t sweep_worker(void* ctx) {
@@ -539,13 +548,12 @@ static int32_t sweep_worker(void* ctx) {
         // above-trigger peak this sweep -> haptic cue + busy-channel history
         if(smax > app->trigger) {
             hist_add(app, (uint16_t)((fs + (uint32_t)smaxi * st) / 1000000));
-            // haptic locate cue: pulse the vibro, more often the stronger it is (Geiger-style).
-            // Non-blocking via the notification service.
-            if(app->haptic && app->notif) {
+            // haptic locate cue: a short vibro tick, more often the stronger it is
+            // (Geiger-style). Only while the spectrum is on screen -- not during config setup.
+            if(app->haptic && app->notif && app->spec_active) {
                 uint8_t over = (uint8_t)(smax - app->trigger);
                 uint8_t every = over >= 20 ? 1 : over >= 12 ? 2 : over >= 6 ? 3 : 4;
-                if((app->sweeps % every) == 0)
-                    notification_message(app->notif, &sequence_single_vibro);
+                if((app->sweeps % every) == 0) notification_message(app->notif, &seq_vibro_tick);
             }
         }
 
@@ -1167,6 +1175,16 @@ static uint32_t to_conf(void* ctx) {
     return VIEW_CONF; // Back from the spectrum returns to config
 }
 
+// the haptic cue only runs while the spectrum view is on screen (config/editor/capture quiet)
+static void spec_enter(void* ctx) {
+    App* app = ctx;
+    app->spec_active = true;
+}
+static void spec_exit(void* ctx) {
+    App* app = ctx;
+    app->spec_active = false;
+}
+
 // ---- custom range editor (VIEW_RANGE) --------------------------------------
 // Styled after the stock Frequency Analyzer: the active field (Start or End) is a big
 // boxed number; Left/Right pick a digit, Up/Down change it, OK swaps Start<->End, Back
@@ -1688,6 +1706,8 @@ int32_t rf_survey_app(void* p) {
     view_set_draw_callback(app->view, spectrum_draw);
     view_set_input_callback(app->view, spectrum_input);
     view_set_previous_callback(app->view, to_conf);
+    view_set_enter_callback(app->view, spec_enter);
+    view_set_exit_callback(app->view, spec_exit);
     view_dispatcher_add_view(app->vd, VIEW_SPEC, app->view);
 
     // config view (VariableItemList): pick a band preset (full spectrum / full band /
