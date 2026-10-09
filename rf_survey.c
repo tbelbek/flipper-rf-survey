@@ -860,7 +860,7 @@ static void numeric_top4(const App* app, int tv[4], uint16_t tb[4]) {
     tv[0] = tv[1] = tv[2] = tv[3] = -200;
     tb[0] = tb[1] = tb[2] = tb[3] = 0;
     for(uint16_t i = 0; i < app->nbins; i++) {
-        int v = app->rssi[i];
+        int v = app->peak[i]; // rank by peak-hold, not live RSSI, so the list doesn't jitter
         if(v <= -128) continue;
         uint32_t fi = app->f_start + (uint32_t)i * app->f_step;
         int grp = -1; // same-peak slot, if any
@@ -911,37 +911,37 @@ static void draw_numeric(Canvas* canvas, App* app) {
     int floor, ceil;
     autoscale(app, &floor, &ceil);
     const int pitch = 12, bh = 10;
+    int nshown = 0;
     for(int k = 0; k < 4; k++) {
+        if(tv[k] <= -200) continue; // empty slot -> draw nothing (no stray outline)
+        nshown++;
         int y = 1 + k * pitch;
-        if(tv[k] <= -200) {
-            canvas_draw_frame(canvas, 0, y, SCR_W, bh); // empty slot outline
-        } else {
-            uint32_t f = app->f_start + (uint32_t)tb[k] * app->f_step;
-            int len = (tv[k] - floor) * SCR_W / ((ceil > floor) ? (ceil - floor) : 1);
-            if(len < 2) len = 2;
-            if(len > SCR_W) len = SCR_W;
-            canvas_draw_box(canvas, 0, y, len, bh);
-            const FreqBand* b = band_lookup(f);
-            char s[36];
-            snprintf(
-                s,
-                sizeof(s),
-                "%lu.%03lu  %d  %s",
-                (unsigned long)(f / 1000000),
-                (unsigned long)((f / 1000) % 1000),
-                tv[k],
-                b ? b->name : "");
-            canvas_set_color(canvas, ColorXOR); // reverse over the filled part, normal over empty
-            canvas_draw_str(canvas, 3, y + bh - 2, s);
-            canvas_set_color(canvas, ColorBlack);
-        }
-        // cursor bracket around the selected slot (the one OK will capture), in the 2px gaps
+        uint32_t f = app->f_start + (uint32_t)tb[k] * app->f_step;
+        int len = (tv[k] - floor) * SCR_W / ((ceil > floor) ? (ceil - floor) : 1);
+        if(len < 2) len = 2;
+        if(len > SCR_W) len = SCR_W;
+        canvas_draw_box(canvas, 0, y, len, bh);
+        const FreqBand* b = band_lookup(f);
+        char s[36];
+        snprintf(
+            s,
+            sizeof(s),
+            "%lu.%03lu  %d  %s",
+            (unsigned long)(f / 1000000),
+            (unsigned long)((f / 1000) % 1000),
+            tv[k],
+            b ? b->name : "");
+        canvas_set_color(canvas, ColorXOR); // reverse over the filled part, normal over empty
+        canvas_draw_str(canvas, 3, y + bh - 2, s);
+        canvas_set_color(canvas, ColorBlack);
+        // cursor bracket around the selected non-empty row (the one OK will capture)
         if(k == app->num_sel) {
             canvas_draw_line(canvas, 0, y - 1, SCR_W - 1, y - 1);
             canvas_draw_line(canvas, 0, y + bh, SCR_W - 1, y + bh);
             canvas_draw_line(canvas, SCR_W - 1, y - 1, SCR_W - 1, y + bh);
         }
     }
+    if(nshown == 0) canvas_draw_str(canvas, 2, 30, "no peaks yet (peak-hold)");
 }
 
 // History page: the session's busiest 1 MHz channels (peaked above the trigger), sorted by
@@ -1094,20 +1094,28 @@ static bool spectrum_input(InputEvent* event, void* context) {
         spec_redraw(app);
         return true;
     }
-    // Up/Down: move the capture cursor on the numeric page, else cycle the time window
+    // Up/Down: move the capture cursor on the numeric page (only over filled rows, which are
+    // contiguous from 0 since the list is sorted), else cycle the time window
+    if((event->key == InputKeyUp || event->key == InputKeyDown) && sp && app->page == 3) {
+        int tv[4];
+        uint16_t tb[4];
+        numeric_top4(app, tv, tb);
+        int cnt = 0;
+        while(cnt < 4 && tv[cnt] > -200)
+            cnt++;
+        if(cnt < 1) cnt = 1;
+        int d = (event->key == InputKeyUp) ? cnt - 1 : 1;
+        app->num_sel = (uint8_t)((app->num_sel + d) % cnt);
+        spec_redraw(app);
+        return true;
+    }
     if(event->key == InputKeyUp && sp) {
-        if(app->page == 3)
-            app->num_sel = (uint8_t)((app->num_sel + 3) % 4);
-        else if(app->win_idx < (uint8_t)(WIN_N - 1))
-            app->win_idx++;
+        if(app->win_idx < (uint8_t)(WIN_N - 1)) app->win_idx++;
         spec_redraw(app);
         return true;
     }
     if(event->key == InputKeyDown && sp) {
-        if(app->page == 3)
-            app->num_sel = (uint8_t)((app->num_sel + 1) % 4);
-        else if(app->win_idx > 0)
-            app->win_idx--;
+        if(app->win_idx > 0) app->win_idx--;
         spec_redraw(app);
         return true;
     }
