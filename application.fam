@@ -9,5 +9,5 @@ App(
     fap_version="0.1",
     fap_author="tbelbek",
     fap_description="Sweep a frequency range, log RSSI over time to CSV, locate a source and capture it to .sub. Sub-GHz only, RX.",
-    requires=["gui", "storage"],
+    requires=["gui", "storage", "notification"],
 )

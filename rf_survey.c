@@ -8,6 +8,7 @@
 #include <gui/modules/variable_item_list.h>
 #include <storage/storage.h>
 #include <furi_hal_rtc.h>
+#include <notification/notification_messages.h>
 
 // CC1101 preset register tables exported to apps. These set the RX filter bandwidth; the
 // survey preset is user-selectable in config (same four names the stock Spectrum Analyzer /
@@ -192,15 +193,16 @@ typedef struct {
 
     // waterfall: one column per completed sweep (1024 bins max-folded to WF_ROWS freq rows),
     // ring over time. col_ms stamps each column's wall-clock (ms) so both new pages window by
-    // real time, not sweep count. col_thr freezes the lit/unlit threshold at capture time so
-    // old columns don't re-threshold (flicker) under a moving autoscale. (col_ms/col_thr are
-    // not byte-atomic, but a torn read only mis-windows one column -> cosmetic, like rssi[].)
+    // real time, not sweep count. The lit/unlit cut is the user Trigger (a fixed dBm floor),
+    // so it never flickers under autoscale and separates weak from strong deterministically.
+    // (col_ms is not byte-atomic, but a torn read only mis-windows one column -> cosmetic.)
     int8_t wf[WF_ROWS][WF_COLS];
-    int8_t col_thr[WF_COLS];
     uint32_t col_ms[WF_COLS];
     uint8_t wf_head;
     uint8_t wf_count;
     volatile uint8_t win_sec; // display window for connected/waterfall pages (5..60 s)
+    volatile int8_t trigger; // dBm floor: waterfall-lit / haptic / history / capture gate
+    volatile bool haptic; // vibro pulse when a bin exceeds the trigger (hands-free locate)
 
     // CSV logging. The worker owns the File*; the GUI (long-OK) only flips `recording`.
     // Stopped on any reconfig so the fixed-column CSV never mixes two ranges. Rows flush in
@@ -220,6 +222,7 @@ typedef struct {
     FuriThread* worker;
     volatile bool running;
 
+    NotificationApp* notif; // haptic feedback (vibro)
     Gui* gui;
     ViewDispatcher* vd;
     View* view; // spectrum
@@ -403,15 +406,16 @@ static int32_t sweep_worker(void* ctx) {
             if(r > app->peak[i]) app->peak[i] = r;
         }
         // commit this sweep as one waterfall column: max-fold the bins to WF_ROWS freq rows,
-        // freeze a lit threshold from the current autoscale, timestamp it (one col == one sweep,
-        // so the real time resolution is the sweep period -- honest, no fabricated sub-bins).
+        // timestamp it (one col == one sweep, so the real time resolution is the sweep period
+        // -- honest, no fabricated sub-bins). The lit cut is the user Trigger, applied at draw.
+        int8_t speak = -128; // this sweep's strongest bin, for haptic + history
         {
-            int fl, ce;
-            autoscale(app, &fl, &ce);
             uint8_t h = (uint8_t)((app->wf_head + 1) % WF_COLS);
-            for(int r = 0; r < WF_ROWS; r++)
-                app->wf[r][h] = wf_row_max(app, r);
-            app->col_thr[h] = (int8_t)(fl + (ce - fl) * 3 / 10);
+            for(int r = 0; r < WF_ROWS; r++) {
+                int8_t v = wf_row_max(app, r);
+                app->wf[r][h] = v;
+                if(v > speak) speak = v;
+            }
             app->col_ms[h] = furi_get_tick();
             app->wf_head = h;
             if(app->wf_count < WF_COLS) app->wf_count++;
@@ -419,6 +423,15 @@ static int32_t sweep_worker(void* ctx) {
         app->sweeps++;
         if((app->sweeps & 0x0F) == 0)
             FURI_LOG_D(TAG, "worker: sweep %lu", (unsigned long)app->sweeps);
+
+        // haptic locate cue: when the strongest bin clears the trigger, pulse the vibro once,
+        // more often the stronger it is (Geiger-style). Non-blocking via the notification svc.
+        if(app->haptic && app->notif && speak > app->trigger) {
+            uint8_t over = (uint8_t)(speak - app->trigger);
+            uint8_t every = over >= 20 ? 1 : over >= 12 ? 2 : over >= 6 ? 3 : 4;
+            if((app->sweeps % every) == 0)
+                notification_message(app->notif, &sequence_single_vibro);
+        }
 
         // log one CSV row for this sweep: "t_ms,rssi0,..,rssiN", flushed in CSV_BUF chunks
         // (one FAT sector) so the row buffer stays 512 B instead of ~5 KB.
@@ -596,6 +609,12 @@ static void draw_bars(Canvas* canvas, App* app, int floor, int ceil) {
         if(ph > 0) canvas_draw_line(canvas, x, BASE_Y - ph, x + BAR_PITCH - 2, BASE_Y - ph);
     }
     canvas_draw_line(canvas, 0, BASE_Y + 1, SCR_W - 1, BASE_Y + 1);
+    // dotted trigger line: the floor that the waterfall/haptic use (where a bar clears it,
+    // that bin counts as "signal")
+    int th = bar_h(app->trigger, floor, ceil);
+    int ty = BASE_Y - th;
+    for(int x = 0; x < SCR_W; x += 4)
+        canvas_draw_dot(canvas, x, ty);
     // wide cursor frame around the selected grouped bar (the band you'd zoom into)
     int cx = (int)app->cursor * BAR_PITCH;
     if(cx < 1) cx = 1;
@@ -671,7 +690,7 @@ static void draw_waterfall(Canvas* canvas, App* app) {
             }
             if(best < 0) continue;
             for(int r = 0; r < WF_ROWS; r++) {
-                if(app->wf[r][best] > app->col_thr[best]) {
+                if(app->wf[r][best] > app->trigger) { // lit only above the user floor
                     int y0 = r * WF_H / WF_ROWS;
                     int y1 = (r + 1) * WF_H / WF_ROWS;
                     if(y1 <= y0) y1 = y0 + 1;
@@ -1058,6 +1077,24 @@ static void step_cb(VariableItem* item) {
     app->reconfig = true;
 }
 
+// Trigger floor: -100..-45 dBm in 5 dB steps (12 values). Separates weak from strong for
+// the waterfall, haptic, history and (later) capture gating.
+#define TRIG_N   12
+#define TRIG_MIN -100
+static void trigger_cb(VariableItem* item) {
+    App* app = variable_item_get_context(item);
+    app->trigger = (int8_t)(TRIG_MIN + (int)variable_item_get_current_value_index(item) * 5);
+    char t[8];
+    snprintf(t, sizeof(t), "%d", app->trigger);
+    variable_item_set_current_value_text(item, t);
+}
+
+static void haptic_cb(VariableItem* item) {
+    App* app = variable_item_get_context(item);
+    app->haptic = variable_item_get_current_value_index(item) ? true : false;
+    variable_item_set_current_value_text(item, app->haptic ? "On" : "Off");
+}
+
 static void conf_enter(void* ctx, uint32_t index) {
     App* app = ctx;
     if(index == 1) { // "Range MHz" row -> open the custom range editor
@@ -1102,6 +1139,8 @@ int32_t rf_survey_app(void* p) {
     app->preset_idx = 0; // AM650: widest OOK filter, best broadband survey pickup
     app->cursor = NBARS / 2;
     app->win_sec = 60; // default time window (max)
+    app->trigger = -85; // default floor: above the CC1101 noise floor, below real signals
+    app->haptic = false;
     // defensive against bad config (future editable ranges): never div-by-zero,
     // never an inverted range, always 1..MAX_BINS bins, and keep f_end consistent
     // with the bins actually scanned so the axis labels can't lie.
@@ -1117,6 +1156,7 @@ int32_t rf_survey_app(void* p) {
         app->peak[i] = -128;
     }
 
+    app->notif = furi_record_open(RECORD_NOTIFICATION);
     app->gui = furi_record_open(RECORD_GUI);
     app->vd = view_dispatcher_alloc();
     view_dispatcher_attach_to_gui(app->vd, app->gui, ViewDispatcherTypeFullscreen);
@@ -1144,6 +1184,16 @@ int32_t rf_survey_app(void* p) {
     vi = variable_item_list_add(app->conf, "Step", COUNT_OF(STEP_HZ), step_cb, app);
     variable_item_set_current_value_index(vi, 4); // 650k
     variable_item_set_current_value_text(vi, "650k");
+    vi = variable_item_list_add(app->conf, "Trigger", TRIG_N, trigger_cb, app);
+    variable_item_set_current_value_index(vi, (uint8_t)((app->trigger - TRIG_MIN) / 5));
+    {
+        char t[8];
+        snprintf(t, sizeof(t), "%d", app->trigger);
+        variable_item_set_current_value_text(vi, t);
+    }
+    vi = variable_item_list_add(app->conf, "Haptic", 2, haptic_cb, app);
+    variable_item_set_current_value_index(vi, app->haptic ? 1 : 0);
+    variable_item_set_current_value_text(vi, app->haptic ? "On" : "Off");
     variable_item_list_set_enter_callback(app->conf, conf_enter, app);
     view_set_previous_callback(variable_item_list_get_view(app->conf), view_exit);
     view_dispatcher_add_view(app->vd, VIEW_CONF, variable_item_list_get_view(app->conf));
@@ -1193,6 +1243,7 @@ int32_t rf_survey_app(void* p) {
     variable_item_list_free(app->conf);
     view_dispatcher_free(app->vd);
     furi_record_close(RECORD_GUI);
+    furi_record_close(RECORD_NOTIFICATION);
     g_app = NULL; // defensive: a stray draw after this sees NULL, not freed memory
     free(app);
     FURI_LOG_I(TAG, "app: end");
