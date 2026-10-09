@@ -217,6 +217,13 @@ typedef struct {
     volatile int8_t trigger; // dBm floor: waterfall-lit / haptic / history / capture gate
     volatile bool haptic; // vibro pulse when a bin exceeds the trigger (hands-free locate)
 
+    // session busy-channel history: which 1 MHz buckets peaked above the trigger, how often
+    struct {
+        uint16_t mhz;
+        uint16_t count;
+    } hist[8];
+    uint8_t hist_n;
+
     // CSV logging. The worker owns the File*; the GUI (long-OK) only flips `recording`.
     // Stopped on any reconfig so the fixed-column CSV never mixes two ranges. Rows flush in
     // CSV_BUF chunks (one FAT sector) so this stays 512 B, not a 5 KB per-row line buffer.
@@ -266,6 +273,28 @@ static int8_t wf_row_max(const App* app, int r) {
     for(uint32_t b = b0; b < b1; b++)
         if(app->rssi[b] > m) m = app->rssi[b];
     return m;
+}
+
+// record a 1 MHz bucket hit in the session history (MRU by count): bump if present, else
+// add, else overwrite the weakest entry. Written by the worker, read by the GUI (cosmetic).
+static void hist_add(App* app, uint16_t mhz) {
+    for(uint8_t i = 0; i < app->hist_n; i++) {
+        if(app->hist[i].mhz == mhz) {
+            if(app->hist[i].count < 0xFFFF) app->hist[i].count++;
+            return;
+        }
+    }
+    if(app->hist_n < COUNT_OF(app->hist)) {
+        app->hist[app->hist_n].mhz = mhz;
+        app->hist[app->hist_n].count = 1;
+        app->hist_n++;
+        return;
+    }
+    uint8_t lo = 0; // full: replace the lowest-count slot
+    for(uint8_t i = 1; i < app->hist_n; i++)
+        if(app->hist[i].count < app->hist[lo].count) lo = i;
+    app->hist[lo].mhz = mhz;
+    app->hist[lo].count = 1;
 }
 
 // ---- CSV logging -----------------------------------------------------------
@@ -384,6 +413,7 @@ static int32_t sweep_worker(void* ctx) {
             app->wf_count = 0;
             memset(app->wf, -128, sizeof(app->wf)); // waterfall history is per-range
             memset(app->col_ms, 0, sizeof(app->col_ms));
+            app->hist_n = 0; // busy-channel history is per-range too
             app->reconfig = false;
             FURI_LOG_I(
                 TAG,
@@ -406,6 +436,8 @@ static int32_t sweep_worker(void* ctx) {
         // snapshot the range for this sweep: a mid-sweep config change (GUI) then only
         // takes effect next loop via reconfig, so one row is never a torn A/B mix.
         uint32_t fs = app->f_start, st = app->f_step;
+        int8_t smax = -128; // this sweep's strongest bin + its index (haptic + history)
+        uint16_t smaxi = 0;
         for(uint16_t i = 0; i < app->nbins && app->running; i++) {
             uint32_t f = fs + (uint32_t)i * st;
             if(!furi_hal_subghz_is_frequency_valid(f) || !tune_rx(f)) {
@@ -417,18 +449,18 @@ static int32_t sweep_worker(void* ctx) {
             int8_t r = (rf < -127.0f) ? (int8_t)-127 : (int8_t)rf; // keep -128 as the sentinel
             app->rssi[i] = r;
             if(r > app->peak[i]) app->peak[i] = r;
+            if(r > smax) {
+                smax = r;
+                smaxi = i;
+            }
         }
         // commit this sweep as one waterfall column: max-fold the bins to WF_ROWS freq rows,
         // timestamp it (one col == one sweep, so the real time resolution is the sweep period
         // -- honest, no fabricated sub-bins). The lit cut is the user Trigger, applied at draw.
-        int8_t speak = -128; // this sweep's strongest bin, for haptic + history
         {
             uint8_t h = (uint8_t)((app->wf_head + 1) % WF_COLS);
-            for(int r = 0; r < WF_ROWS; r++) {
-                int8_t v = wf_row_max(app, r);
-                app->wf[r][h] = v;
-                if(v > speak) speak = v;
-            }
+            for(int r = 0; r < WF_ROWS; r++)
+                app->wf[r][h] = wf_row_max(app, r);
             app->col_ms[h] = furi_get_tick();
             app->wf_head = h;
             if(app->wf_count < WF_COLS) app->wf_count++;
@@ -437,13 +469,17 @@ static int32_t sweep_worker(void* ctx) {
         if((app->sweeps & 0x0F) == 0)
             FURI_LOG_D(TAG, "worker: sweep %lu", (unsigned long)app->sweeps);
 
-        // haptic locate cue: when the strongest bin clears the trigger, pulse the vibro once,
-        // more often the stronger it is (Geiger-style). Non-blocking via the notification svc.
-        if(app->haptic && app->notif && speak > app->trigger) {
-            uint8_t over = (uint8_t)(speak - app->trigger);
-            uint8_t every = over >= 20 ? 1 : over >= 12 ? 2 : over >= 6 ? 3 : 4;
-            if((app->sweeps % every) == 0)
-                notification_message(app->notif, &sequence_single_vibro);
+        // above-trigger peak this sweep -> haptic cue + busy-channel history
+        if(smax > app->trigger) {
+            hist_add(app, (uint16_t)((fs + (uint32_t)smaxi * st) / 1000000));
+            // haptic locate cue: pulse the vibro, more often the stronger it is (Geiger-style).
+            // Non-blocking via the notification service.
+            if(app->haptic && app->notif) {
+                uint8_t over = (uint8_t)(smax - app->trigger);
+                uint8_t every = over >= 20 ? 1 : over >= 12 ? 2 : over >= 6 ? 3 : 4;
+                if((app->sweeps % every) == 0)
+                    notification_message(app->notif, &sequence_single_vibro);
+            }
         }
 
         // log one CSV row for this sweep: "t_ms,rssi0,..,rssiN", flushed in CSV_BUF chunks
@@ -800,6 +836,37 @@ static void draw_numeric(Canvas* canvas, App* app) {
     }
 }
 
+// History page: the session's busiest 1 MHz channels (peaked above the trigger), sorted by
+// hit count, tagged with the likely band. "which channels are active, and how often."
+static void draw_history(Canvas* canvas, App* app) {
+    canvas_set_font(canvas, FontSecondary);
+    canvas_draw_str(canvas, 2, 8, "Busy channels (xN)");
+    if(app->hist_n == 0) {
+        canvas_draw_str(canvas, 2, 30, "none above trigger yet");
+        return;
+    }
+    // selection-sort the top rows by count (<=8 entries, trivial)
+    uint8_t order[8];
+    for(uint8_t i = 0; i < app->hist_n; i++)
+        order[i] = i;
+    for(uint8_t i = 0; i < app->hist_n; i++)
+        for(uint8_t j = i + 1; j < app->hist_n; j++)
+            if(app->hist[order[j]].count > app->hist[order[i]].count) {
+                uint8_t t = order[i];
+                order[i] = order[j];
+                order[j] = t;
+            }
+    int rows = app->hist_n < 4 ? app->hist_n : 4;
+    for(int k = 0; k < rows; k++) {
+        uint16_t mhz = app->hist[order[k]].mhz;
+        uint16_t cnt = app->hist[order[k]].count;
+        const FreqBand* b = band_lookup((uint32_t)mhz * 1000000);
+        char s[40];
+        snprintf(s, sizeof(s), "%u %s x%u", (unsigned)mhz, b ? b->name : "", (unsigned)cnt);
+        canvas_draw_str(canvas, 2, 20 + k * 10, s);
+    }
+}
+
 static void spectrum_draw(Canvas* canvas, void* model) {
     UNUSED(model);
     App* app = g_app;
@@ -820,6 +887,8 @@ static void spectrum_draw(Canvas* canvas, void* model) {
         canvas_draw_str_aligned(canvas, 64, 62, AlignCenter, AlignBottom, r);
     } else if(app->page == 2) {
         draw_waterfall(canvas, app); // full-bleed, carries its own range + span labels
+    } else if(app->page == 4) {
+        draw_history(canvas, app);
     } else {
         // header: range + likely band name (+ window seconds on the connected page)
         uint32_t fc = app->f_start / 2 + app->f_end / 2;
@@ -909,7 +978,7 @@ static bool spectrum_input(InputEvent* event, void* context) {
         if(sp && app->page == 0 && app->cursor > 0)
             app->cursor--; // move cursor
         else
-            app->page = (uint8_t)((app->page + 3) % 4); // edge / long -> prev page
+            app->page = (uint8_t)((app->page + 4) % 5); // edge / long -> prev page
         spec_redraw(app);
         return true;
     }
@@ -917,7 +986,7 @@ static bool spectrum_input(InputEvent* event, void* context) {
         if(sp && app->page == 0 && app->cursor < NBARS - 1)
             app->cursor++;
         else
-            app->page = (uint8_t)((app->page + 1) % 4); // edge / long -> next page
+            app->page = (uint8_t)((app->page + 1) % 5); // edge / long -> next page
         spec_redraw(app);
         return true;
     }
