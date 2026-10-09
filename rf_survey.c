@@ -426,61 +426,55 @@ static void draw_waterfall(Canvas* canvas, App* app, int floor, int ceil) {
     }
 }
 
-static void draw_card(Canvas* canvas, int x0, int y0, int x1, int y1, uint32_t f, int dbm) {
-    if(x1 - x0 < 10 || y1 - y0 < 9) return; // too small to render
-    canvas_draw_frame(canvas, x0, y0, x1 - x0 - 1, y1 - y0 - 1);
-    char s[20];
-    snprintf(
-        s, sizeof(s), "%lu.%lu", (unsigned long)(f / 1000000), (unsigned long)((f / 100000) % 10));
-    canvas_draw_str(canvas, x0 + 3, y0 + 9, s);
-    if(y1 - y0 >= 17) {
-        const FreqBand* b = band_lookup(f);
-        snprintf(s, sizeof(s), "%d %s", dbm, b ? b->name : "");
-        canvas_draw_str(canvas, x0 + 3, y0 + 17, s);
-    }
-}
-
-// 2x2 "treemap": each card's area is proportional to its signal strength, so a dominant
-// signal gets a bigger card and four equal signals split into equal quarters.
+// Numeric page: 4 full-width horizontal bars (precise top-4 bins). Bar length ~ strength;
+// the "<freq> <dBm> ~<band>" label is drawn in XOR so it reads black on the empty part and
+// white over the filled part. Fills the whole screen; the locked range sits by the pills.
 static void draw_numeric(Canvas* canvas, App* app) {
     int tv[4] = {-200, -200, -200, -200};
-    uint16_t tk[4] = {0};
-    for(uint16_t k = 0; k < NBARS; k++) {
-        int8_t cur, pk;
-        grp_max(app, k, &cur, &pk);
-        int v = cur;
+    uint16_t tb[4] = {0}; // precise top-4 bins
+    for(uint16_t i = 0; i < app->nbins; i++) {
+        int v = app->rssi[i];
+        if(v <= -128) continue;
         for(int m = 0; m < 4; m++) {
             if(v > tv[m]) {
                 for(int j = 3; j > m; j--) {
                     tv[j] = tv[j - 1];
-                    tk[j] = tk[j - 1];
+                    tb[j] = tb[j - 1];
                 }
                 tv[m] = v;
-                tk[m] = k;
+                tb[m] = i;
                 break;
             }
         }
     }
-    int w[4], tot = 0;
-    for(int m = 0; m < 4; m++) {
-        w[m] = (tv[m] <= -128) ? 0 : (tv[m] - (int)RSSI_FLOOR + 1);
-        if(w[m] < 0) w[m] = 0;
-        tot += w[m];
+    int floor, ceil;
+    autoscale(app, &floor, &ceil);
+    const int pitch = 12, bh = 10;
+    for(int k = 0; k < 4; k++) {
+        int y = 1 + k * pitch;
+        if(tv[k] <= -200) {
+            canvas_draw_frame(canvas, 0, y, SCR_W, bh); // empty slot outline
+            continue;
+        }
+        uint32_t f = app->f_start + (uint32_t)tb[k] * app->f_step;
+        int len = (tv[k] - floor) * SCR_W / ((ceil > floor) ? (ceil - floor) : 1);
+        if(len < 2) len = 2;
+        if(len > SCR_W) len = SCR_W;
+        canvas_draw_box(canvas, 0, y, len, bh);
+        const FreqBand* b = band_lookup(f);
+        char s[36];
+        snprintf(
+            s,
+            sizeof(s),
+            "%lu.%03lu  %d  %s",
+            (unsigned long)(f / 1000000),
+            (unsigned long)((f / 1000) % 1000),
+            tv[k],
+            b ? b->name : "");
+        canvas_set_color(canvas, ColorXOR); // reverse over the filled part, normal over empty
+        canvas_draw_str(canvas, 3, y + bh - 2, s);
+        canvas_set_color(canvas, ColorBlack);
     }
-    if(tot <= 0) {
-        canvas_draw_str(canvas, 28, BODY_Y0 + 16, "no signals");
-        return;
-    }
-    int X0 = 0, X1 = SCR_W, Y0 = BODY_Y0, Y1 = BASE_Y + 2;
-    int xs = X0 + (X1 - X0) * (w[0] + w[2]) / tot; // vertical split by column weight
-    if(xs < X0 + 36) xs = X0 + 36;
-    if(xs > X1 - 36) xs = X1 - 36;
-    int ysl = Y0 + ((w[0] + w[2]) ? (Y1 - Y0) * w[0] / (w[0] + w[2]) : (Y1 - Y0));
-    int ysr = Y0 + ((w[1] + w[3]) ? (Y1 - Y0) * w[1] / (w[1] + w[3]) : (Y1 - Y0));
-    if(w[0]) draw_card(canvas, X0, Y0, xs, ysl, grp_freq(app, tk[0]), tv[0]);
-    if(w[2]) draw_card(canvas, X0, ysl, xs, Y1, grp_freq(app, tk[2]), tv[2]);
-    if(w[1]) draw_card(canvas, xs, Y0, X1, ysr, grp_freq(app, tk[1]), tv[1]);
-    if(w[3]) draw_card(canvas, xs, ysr, X1, Y1, grp_freq(app, tk[3]), tv[3]);
 }
 
 static void spectrum_draw(Canvas* canvas, void* model) {
@@ -490,44 +484,53 @@ static void spectrum_draw(Canvas* canvas, void* model) {
     canvas_clear(canvas);
     canvas_set_font(canvas, FontSecondary);
 
-    // header: just the range + the likely band name (short) for the range center
-    uint32_t fc = app->f_start / 2 + app->f_end / 2;
-    const FreqBand* hb = band_lookup(fc);
-    char hdr[40];
-    snprintf(
-        hdr,
-        sizeof(hdr),
-        "%lu-%lu %s",
-        (unsigned long)(app->f_start / 1000000),
-        (unsigned long)(app->f_end / 1000000),
-        hb ? hb->name : "");
-    canvas_draw_str(canvas, 2, 8, hdr);
-
-    // info line: cursor readout on bars, global peak otherwise
-    if(app->page == 0) {
-        int8_t cur, pk;
-        grp_max(app, app->cursor, &cur, &pk);
-        draw_info(canvas, grp_freq(app, app->cursor), cur);
-    } else {
-        int pmax = -200;
-        uint16_t pidx = 0;
-        for(uint16_t i = 0; i < app->nbins; i++) {
-            if(app->rssi[i] > pmax) {
-                pmax = app->rssi[i];
-                pidx = i;
-            }
-        }
-        draw_info(canvas, app->f_start + (uint32_t)pidx * app->f_step, pmax);
-    }
-
-    int floor, ceil;
-    autoscale(app, &floor, &ceil);
-    if(app->page == 0)
-        draw_bars(canvas, app, floor, ceil);
-    else if(app->page == 1)
-        draw_waterfall(canvas, app, floor, ceil);
-    else
+    if(app->page == 2) {
+        // numeric fills the whole screen; show the locked range by the pills
         draw_numeric(canvas, app);
+        char r[24];
+        snprintf(
+            r,
+            sizeof(r),
+            "%lu-%lu",
+            (unsigned long)(app->f_start / 1000000),
+            (unsigned long)(app->f_end / 1000000));
+        canvas_draw_str_aligned(canvas, 64, 62, AlignCenter, AlignBottom, r);
+    } else {
+        // header: range + likely band name for the range center
+        uint32_t fc = app->f_start / 2 + app->f_end / 2;
+        const FreqBand* hb = band_lookup(fc);
+        char hdr[40];
+        snprintf(
+            hdr,
+            sizeof(hdr),
+            "%lu-%lu %s",
+            (unsigned long)(app->f_start / 1000000),
+            (unsigned long)(app->f_end / 1000000),
+            hb ? hb->name : "");
+        canvas_draw_str(canvas, 2, 8, hdr);
+        // info line: cursor readout on bars, global peak on waterfall
+        if(app->page == 0) {
+            int8_t cur, pk;
+            grp_max(app, app->cursor, &cur, &pk);
+            draw_info(canvas, grp_freq(app, app->cursor), cur);
+        } else {
+            int pmax = -200;
+            uint16_t pidx = 0;
+            for(uint16_t i = 0; i < app->nbins; i++) {
+                if(app->rssi[i] > pmax) {
+                    pmax = app->rssi[i];
+                    pidx = i;
+                }
+            }
+            draw_info(canvas, app->f_start + (uint32_t)pidx * app->f_step, pmax);
+        }
+        int floor, ceil;
+        autoscale(app, &floor, &ceil);
+        if(app->page == 0)
+            draw_bars(canvas, app, floor, ceil);
+        else
+            draw_waterfall(canvas, app, floor, ceil);
+    }
 
     // native pill hints
     elements_button_left(canvas, "Page");
