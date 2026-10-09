@@ -389,16 +389,16 @@ static bool csv_flush(File* csv, const char* buf, int* off) {
 // Return the register array to load for preset p at the current gain. Auto (0) uses the stock
 // array; Mid/Low copy it into preset_buf and patch AGCCTRL2 (0x1B) to cap the AGC's max usable
 // gain (stops a strong nearby source from saturating the front end). RX config only.
-static const uint8_t* preset_regs(App* app, uint8_t p) {
+static const uint8_t* preset_regs(App* app, uint8_t p, uint8_t gain) {
     const uint8_t* src = PRESETS[p].regs;
-    if(app->gain == 0) return src; // Auto / max gain -> stock preset untouched
+    if(gain == 0) return src; // Auto / max gain -> stock preset untouched
     size_t i = 0;
     while(!(src[i] == 0 && src[i + 1] == 0))
         i += 2; // {0,0} terminates the reg pairs
     size_t total = i + 2 + 8; // pairs + terminator + 8-byte PA table
     if(total > sizeof(app->preset_buf)) return src; // too big -> fall back, never overflow
     memcpy(app->preset_buf, src, total);
-    uint8_t v = (app->gain == 1) ? 0x1F : 0xB7; // Mid: LNA-6dB  /  Low: LNA + DVGA reduced
+    uint8_t v = (gain == 1) ? 0x1F : 0xB7; // Mid: LNA-6dB  /  Low: LNA + DVGA reduced
     for(size_t j = 0; j < i; j += 2)
         if(app->preset_buf[j] == 0x1B) { // CC1101_AGCCTRL2
             app->preset_buf[j + 1] = v;
@@ -419,15 +419,16 @@ static int32_t sweep_worker(void* ctx) {
     uint8_t cur_preset = 0xFF, cur_gain = 0xFF; // force a load on the first iteration
 
     while(app->running) {
-        // (re)load the CC1101 preset when the user picks a different preset or gain in config
-        if(cur_preset != app->preset_idx || cur_gain != app->gain) {
-            uint8_t p = app->preset_idx;
-            if(p >= PRESET_N) p = 0;
+        // (re)load the CC1101 preset when the user picks a different preset or gain in config.
+        // Snapshot both once so a change between load and the cur_* assignment can't be lost.
+        uint8_t p = app->preset_idx, g = app->gain;
+        if(p >= PRESET_N) p = 0;
+        if(cur_preset != p || cur_gain != g) {
             furi_hal_subghz_idle();
-            furi_hal_subghz_load_custom_preset(preset_regs(app, p));
+            furi_hal_subghz_load_custom_preset(preset_regs(app, p, g));
             cur_preset = p;
-            cur_gain = app->gain;
-            FURI_LOG_I(TAG, "worker: preset -> %s gain %u", PRESETS[p].name, (unsigned)app->gain);
+            cur_gain = g;
+            FURI_LOG_I(TAG, "worker: preset -> %s gain %u", PRESETS[p].name, (unsigned)g);
         }
         // apply a pending config change: recompute bins for the new range/step and
         // clear the buffers so stale readings from the old range don't linger
@@ -447,6 +448,9 @@ static int32_t sweep_worker(void* ctx) {
             if(n > MAX_BINS) n = MAX_BINS;
             if(n < 1) n = 1;
             app->nbins = (uint16_t)n;
+            // keep f_end honest: after the MAX_BINS cap (or a non-dividing step) the last bin
+            // scanned is f_start+(nbins-1)*step, so pin the displayed end to it (labels can't lie)
+            app->f_end = app->f_start + (uint32_t)(app->nbins - 1) * app->f_step;
             for(uint16_t i = 0; i < app->nbins; i++) {
                 app->rssi[i] = -128;
                 app->peak[i] = -128;
@@ -758,8 +762,9 @@ static void draw_connected(Canvas* canvas, App* app, int floor, int ceil) {
 }
 
 // Horizontal waterfall: X = time (oldest left, newest right), Y = frequency (start at top,
-// end at bottom). Full-bleed above the pills. A cell is lit if that sweep's row cleared the
-// threshold frozen when the column was captured. Columns are placed by real timestamp over
+// end at bottom). Full-bleed above the pills. A cell is lit if that sweep's row is above the
+// current user Trigger (changing it re-lights all history instantly). Columns are placed by
+// real timestamp over
 // the last win_sec, nearest-earlier sample per screen x -> fills width honestly (repeats a
 // real sweep when sweeps are slower than 1px, never invents sub-sweep detail). Shows WHEN a
 // band is busy and the spacing of bursts. Edge labels give the range; center gives the span.
@@ -770,7 +775,9 @@ static void draw_waterfall(Canvas* canvas, App* app) {
         uint32_t span = (uint32_t)win * 1000;
         uint32_t oldest = (newest > span) ? newest - span : 0;
         for(int x = 0; x < SCR_W; x++) {
-            uint32_t t = oldest + (uint32_t)((uint64_t)(newest - oldest) * x / (SCR_W - 1));
+            // (newest-oldest) <= 600 s * 1000 = 6e5; *127 = 7.6e7 < 2^32, so 32-bit math is
+            // exact here -- no 64-bit software divide per column.
+            uint32_t t = oldest + (newest - oldest) * (uint32_t)x / (SCR_W - 1);
             int best = -1;
             uint32_t bestt = 0;
             for(int c = 0; c < WF_COLS; c++) {
@@ -884,22 +891,26 @@ static void draw_numeric(Canvas* canvas, App* app) {
 static void draw_history(Canvas* canvas, App* app) {
     canvas_set_font(canvas, FontSecondary);
     canvas_draw_str(canvas, 2, 8, "Busy channels (xN)");
-    if(app->hist_n == 0) {
+    // snapshot the worker-owned count once: if it grew mid-draw, a reread would index
+    // uninitialized order[] entries and run off hist[].
+    uint8_t n = app->hist_n;
+    if(n > COUNT_OF(app->hist)) n = COUNT_OF(app->hist);
+    if(n == 0) {
         canvas_draw_str(canvas, 2, 30, "none above trigger yet");
         return;
     }
     // selection-sort the top rows by count (<=8 entries, trivial)
     uint8_t order[8];
-    for(uint8_t i = 0; i < app->hist_n; i++)
+    for(uint8_t i = 0; i < n; i++)
         order[i] = i;
-    for(uint8_t i = 0; i < app->hist_n; i++)
-        for(uint8_t j = i + 1; j < app->hist_n; j++)
+    for(uint8_t i = 0; i < n; i++)
+        for(uint8_t j = i + 1; j < n; j++)
             if(app->hist[order[j]].count > app->hist[order[i]].count) {
                 uint8_t t = order[i];
                 order[i] = order[j];
                 order[j] = t;
             }
-    int rows = app->hist_n < 4 ? app->hist_n : 4;
+    int rows = n < 4 ? n : 4;
     for(int k = 0; k < rows; k++) {
         uint16_t mhz = app->hist[order[k]].mhz;
         uint16_t cnt = app->hist[order[k]].count;
@@ -1206,11 +1217,12 @@ static bool range_input(InputEvent* e, void* ctx) {
 }
 
 // ---- .sub capture (VIEW_CAP) -----------------------------------------------
-// Re-implements the stock RAW recorder: start_async_rx streams (level,duration) edges from
-// an ISR into a stream buffer; a capture thread transition-filters them (drop <50 us noise
-// and >=1 s gaps -- the latter also keeps the signed int32 packing from overflowing) and
-// writes RAW_Data rows to a .sub the stock SubGHz app can replay. The survey worker is fully
-// stopped first so only one owner touches the radio.
+// Re-implements the stock RAW recorder: start_async_rx streams (level,duration) edges from an
+// ISR. The ISR drops <50 us noise and >=1 s gaps (the latter also keeps the signed int32
+// packing from overflowing) and pushes the rest to a stream buffer; the capture thread writes
+// RAW_Data rows to a .sub the stock SubGHz app can replay. The survey worker is fully stopped
+// first so only one owner touches the radio. (Dropped edges are not merged -- fine for clean
+// OOK/FSK bursts; very noisy inputs may not replay perfectly.)
 
 #define CAP_STREAM 4096 // int32 slots ISR -> thread (sized for a burst; overflow is counted)
 #define CAP_MAXSPL 60000 // auto-stop after this many durations (bounds the file)
@@ -1237,11 +1249,12 @@ static int32_t capture_worker(void* ctx) {
     snprintf(
         path,
         sizeof(path),
-        "/ext/subghz/rfsurvey_%lu_%02u%02u%02u.sub",
+        "/ext/subghz/rfsurvey_%lu_%02u%02u%02u_%03lu.sub",
         (unsigned long)(app->cap_freq / 1000),
         dt.hour,
         dt.minute,
-        dt.second);
+        dt.second,
+        (unsigned long)(furi_get_tick() % 1000)); // tick suffix: never overwrite a prior .sub
 
     FlipperFormat* ff = flipper_format_file_alloc(storage);
     int32_t* buf = malloc(sizeof(int32_t) * 512);
@@ -1289,10 +1302,13 @@ static int32_t capture_worker(void* ctx) {
         // the stream after we free it; then drain the tail, flush, close, free.
         furi_hal_subghz_stop_async_rx();
         int32_t d;
-        while(furi_stream_buffer_receive(app->cap_stream, &d, sizeof(d), 0) == sizeof(d) &&
-              ind < 512) {
+        while(furi_stream_buffer_receive(app->cap_stream, &d, sizeof(d), 0) == sizeof(d)) {
             buf[ind++] = d;
             app->cap_samples++;
+            if(ind == 512) { // keep draining the tail instead of dropping it at 512
+                flipper_format_write_int32(ff, "RAW_Data", buf, 512);
+                ind = 0;
+            }
         }
         if(ind > 0) flipper_format_write_int32(ff, "RAW_Data", buf, (uint16_t)ind);
         furi_hal_subghz_idle();
@@ -1359,21 +1375,25 @@ static void capture_draw(Canvas* canvas, void* model) {
     }
 }
 
+// Join + free the capture thread handle. Safe whether the thread is still running (sets
+// capturing=false to ask it to stop, then waits) or already self-finished (auto-stop / open
+// or write failure left the handle unreaped). Called before every start so there is never a
+// second worker racing the old one's stream free.
+static void capture_stop(App* app) {
+    if(!app->cap_worker) return;
+    app->capturing = false;
+    furi_thread_join(app->cap_worker); // returns at once if the thread already exited
+    furi_thread_free(app->cap_worker);
+    app->cap_worker = NULL;
+}
+
 static void capture_start(App* app) {
-    if(app->capturing) return;
+    capture_stop(app); // reap any prior worker (running or self-finished) before a new one
     app->capturing = true;
     app->cap_samples = 0;
     app->cap_overflow = 0;
     app->cap_worker = furi_thread_alloc_ex("rfsurvey_cap", 3072, capture_worker, app);
     furi_thread_start(app->cap_worker);
-}
-
-static void capture_stop(App* app) {
-    if(!app->cap_worker) return;
-    app->capturing = false;
-    furi_thread_join(app->cap_worker);
-    furi_thread_free(app->cap_worker);
-    app->cap_worker = NULL;
 }
 
 static bool capture_input(InputEvent* e, void* ctx) {
