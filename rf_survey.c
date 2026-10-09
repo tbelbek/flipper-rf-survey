@@ -935,9 +935,9 @@ static void draw_numeric(Canvas* canvas, App* app) {
             b ? b->name : "");
         canvas_set_color(canvas, ColorXOR); // reverse over the filled part, normal over empty
         canvas_draw_str(canvas, 3, y + bh - 2, s);
-        // selected row (the one OK will capture): "OK" marker at the right end, no box
+        // selected row (the one OK will capture): "<" pointer at the right end, no box
         if(k == app->num_sel)
-            canvas_draw_str_aligned(canvas, SCR_W - 1, y + bh - 2, AlignRight, AlignBottom, "OK");
+            canvas_draw_str_aligned(canvas, SCR_W - 1, y + bh - 2, AlignRight, AlignBottom, "<");
         canvas_set_color(canvas, ColorBlack);
     }
     if(nshown == 0) canvas_draw_str(canvas, 2, 30, "no peaks above trigger");
