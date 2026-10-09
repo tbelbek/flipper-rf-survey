@@ -10,12 +10,19 @@
 // broadband RSSI survey. (Same names the stock Spectrum Analyzer / SubGHz use.)
 extern const uint8_t subghz_device_cc1101_preset_ook_650khz_async_regs[];
 
+// Verbose debug logging: every lifecycle step, config change, worker transition and
+// (coming) logging/capture op is traced so a crash on the remote device can be pinned
+// from the serial `log` without a redeploy. Stream it with the CLI `log` command.
+#define TAG "RFSurvey"
+
 #define MAX_BINS   1024 // enough for a full 300-928 MHz sweep @650k (~967 bins); int8 -> 2 KB
 #define VIEW_SPEC  0
 #define VIEW_CONF  1
 #define SCR_W      128
-#define BASE_Y     54 // spectrum baseline
-#define MAX_H      40 // tallest bar
+#define BASE_Y     50 // spectrum baseline (room for pill buttons below)
+#define MAX_H      28 // tallest bar
+#define BODY_Y0    22 // top of the page body
+#define HIST_ROWS  28 // waterfall history depth (1px per sweep)
 #define RSSI_FLOOR -100.0f
 #define RSSI_CEIL  -40.0f
 
@@ -115,6 +122,19 @@ typedef struct {
     int8_t peak[MAX_BINS];
     uint32_t sweeps;
 
+    // waterfall history: one downsampled (col-max) int8 row per finished sweep, ring buffer
+    int8_t hist[HIST_ROWS][SCR_W];
+    uint8_t hist_head;
+    uint8_t hist_count;
+
+    // spectrum UI state
+    uint8_t page; // 0=bars 1=waterfall 2=numeric
+    uint16_t cursor; // bars cursor column (framed); OK zooms into it
+    struct {
+        uint32_t s, e, st;
+    } zstack[4]; // zoom-out stack (previous ranges)
+    uint8_t zdepth;
+
     FuriThread* worker;
     volatile bool running;
 
@@ -129,10 +149,27 @@ typedef struct {
 
 static App* g_app;
 
+// max rssi/peak over the bins that map to display column px (shared by the bars draw
+// and the waterfall row builder so both downsample the same way)
+static void col_max(const App* app, int px, int8_t* cur, int8_t* pk) {
+    uint32_t b0 = (uint32_t)px * app->nbins / SCR_W;
+    uint32_t b1 = (uint32_t)(px + 1) * app->nbins / SCR_W;
+    if(b1 <= b0) b1 = b0 + 1;
+    if(b1 > app->nbins) b1 = app->nbins;
+    int8_t c = -128, p = -128;
+    for(uint32_t b = b0; b < b1; b++) {
+        if(app->rssi[b] > c) c = app->rssi[b];
+        if(app->peak[b] > p) p = app->peak[b];
+    }
+    *cur = c;
+    *pk = p;
+}
+
 // ---- radio sweep worker ----------------------------------------------------
 
 static int32_t sweep_worker(void* ctx) {
     App* app = ctx;
+    FURI_LOG_I(TAG, "worker: start, reset+preset");
     furi_hal_subghz_reset();
     furi_hal_subghz_load_custom_preset(subghz_device_cc1101_preset_ook_650khz_async_regs);
 
@@ -149,7 +186,16 @@ static int32_t sweep_worker(void* ctx) {
                 app->peak[i] = -128;
             }
             app->sweeps = 0;
+            app->hist_head = 0;
+            app->hist_count = 0; // waterfall history is per-range
             app->reconfig = false;
+            FURI_LOG_I(
+                TAG,
+                "worker: reconfig start=%lu end=%lu step=%lu nbins=%u",
+                (unsigned long)app->f_start,
+                (unsigned long)app->f_end,
+                (unsigned long)app->f_step,
+                app->nbins);
         }
         for(uint16_t i = 0; i < app->nbins && app->running; i++) {
             uint32_t f = app->f_start + (uint32_t)i * app->f_step;
@@ -166,9 +212,21 @@ static int32_t sweep_worker(void* ctx) {
             app->rssi[i] = r;
             if(r > app->peak[i]) app->peak[i] = r;
         }
+        // push a downsampled row into the waterfall ring
+        int8_t* row = app->hist[app->hist_head];
+        for(int px = 0; px < SCR_W; px++) {
+            int8_t c, p;
+            col_max(app, px, &c, &p);
+            row[px] = c;
+        }
+        app->hist_head = (uint8_t)((app->hist_head + 1) % HIST_ROWS);
+        if(app->hist_count < HIST_ROWS) app->hist_count++;
         app->sweeps++;
+        if((app->sweeps & 0x0F) == 0)
+            FURI_LOG_D(TAG, "worker: sweep %lu", (unsigned long)app->sweeps);
     }
 
+    FURI_LOG_I(TAG, "worker: exit, radio idle+sleep");
     furi_hal_subghz_idle();
     furi_hal_subghz_sleep();
     return 0;
@@ -182,88 +240,237 @@ static int bar_h(int dbm) {
     return (dbm - (int)RSSI_FLOOR) * MAX_H / ((int)RSSI_CEIL - (int)RSSI_FLOOR);
 }
 
-static void bars_draw(Canvas* canvas, void* model) {
+static uint32_t col_freq(const App* app, uint16_t px) {
+    uint32_t bin = (uint32_t)px * app->nbins / SCR_W;
+    return app->f_start + bin * app->f_step;
+}
+
+static void spec_redraw(App* app) {
+    with_view_model(app->view, void** m, { UNUSED(m); }, true);
+}
+
+static void zoom_in(App* app, uint16_t px) {
+    if(app->zdepth >= COUNT_OF(app->zstack)) return;
+    uint32_t fc = col_freq(app, px);
+    uint32_t span = app->f_end - app->f_start;
+    uint32_t ns_span = span / 5;
+    if(ns_span < 2000000) ns_span = 2000000; // don't zoom below ~2 MHz
+    uint32_t ns = (fc > ns_span / 2) ? (fc - ns_span / 2) : 300000000;
+    uint32_t ne = ns + ns_span;
+    if(ns < 300000000) ns = 300000000;
+    if(ne > 928000000) {
+        ne = 928000000;
+        ns = (ne > ns_span) ? (ne - ns_span) : 300000000;
+    }
+    app->zstack[app->zdepth].s = app->f_start;
+    app->zstack[app->zdepth].e = app->f_end;
+    app->zstack[app->zdepth].st = app->f_step;
+    app->zdepth++;
+    app->f_start = ns;
+    app->f_end = ne;
+    uint32_t st = app->f_step / 4;
+    if(st < 10000) st = 10000; // finer step, min 10 kHz
+    app->f_step = st;
+    app->cursor = SCR_W / 2;
+    app->reconfig = true;
+    FURI_LOG_I(
+        TAG,
+        "zoom in -> %lu-%lu step=%lu depth=%u",
+        (unsigned long)ns,
+        (unsigned long)ne,
+        (unsigned long)st,
+        app->zdepth);
+}
+
+static void zoom_out(App* app) {
+    if(!app->zdepth) return;
+    app->zdepth--;
+    app->f_start = app->zstack[app->zdepth].s;
+    app->f_end = app->zstack[app->zdepth].e;
+    app->f_step = app->zstack[app->zdepth].st;
+    app->cursor = SCR_W / 2;
+    app->reconfig = true;
+    FURI_LOG_I(TAG, "zoom out depth=%u", app->zdepth);
+}
+
+// peak line: "<freq>.<d> <dBm> ~<band> <AM/FM>" for a given frequency+dBm
+static void draw_info(Canvas* canvas, uint32_t f, int dbm) {
+    char s[48];
+    const FreqBand* b = band_lookup(f);
+    if(b) {
+        snprintf(
+            s,
+            sizeof(s),
+            "%lu.%lu %d ~%s %s",
+            (unsigned long)(f / 1000000),
+            (unsigned long)((f / 100000) % 10),
+            dbm,
+            b->name,
+            mod_str(b->mod));
+    } else {
+        snprintf(
+            s,
+            sizeof(s),
+            "%lu.%lu MHz  %d dBm",
+            (unsigned long)(f / 1000000),
+            (unsigned long)((f / 100000) % 10),
+            dbm);
+    }
+    canvas_draw_str(canvas, 2, 18, s);
+}
+
+static void draw_bars(Canvas* canvas, App* app) {
+    for(int px = 0; px < SCR_W; px++) {
+        int8_t cur, pk;
+        col_max(app, px, &cur, &pk);
+        int h = bar_h(cur);
+        if(h > 0) canvas_draw_line(canvas, px, BASE_Y, px, BASE_Y - h);
+        int ph = bar_h(pk);
+        if(ph > 0) canvas_draw_dot(canvas, px, BASE_Y - ph);
+    }
+    canvas_draw_line(canvas, 0, BASE_Y + 1, SCR_W - 1, BASE_Y + 1);
+    // cursor frame (the band you'd zoom into)
+    int cx = app->cursor;
+    if(cx < 1) cx = 1;
+    if(cx > SCR_W - 2) cx = SCR_W - 2;
+    canvas_draw_frame(canvas, cx - 1, BODY_Y0 - 2, 3, BASE_Y - BODY_Y0 + 3);
+}
+
+static void draw_waterfall(Canvas* canvas, App* app) {
+    // newest row at the top; a dot where the column was above the activity threshold
+    for(uint8_t r = 0; r < app->hist_count && r < HIST_ROWS; r++) {
+        uint8_t idx = (uint8_t)((app->hist_head + HIST_ROWS - 1 - r) % HIST_ROWS);
+        int y = BODY_Y0 + r;
+        if(y > BASE_Y) break;
+        const int8_t* row = app->hist[idx];
+        for(int px = 0; px < SCR_W; px++) {
+            if(row[px] > (int8_t)(RSSI_FLOOR + 12)) canvas_draw_dot(canvas, px, y);
+        }
+    }
+}
+
+static void draw_numeric(Canvas* canvas, App* app) {
+    // top 4 columns by current level, shown as "freq: dBm ~band"
+    int top_v[4] = {-200, -200, -200, -200};
+    uint16_t top_px[4] = {0, 0, 0, 0};
+    for(int px = 0; px < SCR_W; px++) {
+        int8_t cur, pk;
+        col_max(app, px, &cur, &pk);
+        int v = cur;
+        for(int k = 0; k < 4; k++) {
+            if(v > top_v[k]) {
+                for(int j = 3; j > k; j--) {
+                    top_v[j] = top_v[j - 1];
+                    top_px[j] = top_px[j - 1];
+                }
+                top_v[k] = v;
+                top_px[k] = px;
+                break;
+            }
+        }
+    }
+    for(int k = 0; k < 4; k++) {
+        if(top_v[k] <= -128) continue;
+        uint32_t f = col_freq(app, top_px[k]);
+        const FreqBand* b = band_lookup(f);
+        char s[40];
+        snprintf(
+            s,
+            sizeof(s),
+            "%lu.%lu %d %s",
+            (unsigned long)(f / 1000000),
+            (unsigned long)((f / 100000) % 10),
+            top_v[k],
+            b ? b->name : "");
+        canvas_draw_str(canvas, 2, BODY_Y0 + 8 + k * 8, s);
+    }
+}
+
+static void spectrum_draw(Canvas* canvas, void* model) {
     UNUSED(model);
     App* app = g_app;
     if(!app) return; // defensive: never draw after teardown
     canvas_clear(canvas);
     canvas_set_font(canvas, FontSecondary);
 
-    // find the current peak bin
-    int pmax = -200;
-    uint16_t pidx = 0;
-    for(uint16_t i = 0; i < app->nbins; i++) {
-        if(app->rssi[i] > pmax) {
-            pmax = app->rssi[i];
-            pidx = i;
-        }
-    }
-    uint32_t pfreq = app->f_start + (uint32_t)pidx * app->f_step;
-
+    // header: range + page + sweeps
     char hdr[40];
     snprintf(
         hdr,
         sizeof(hdr),
-        "%lu-%lu  sw%lu",
+        "%lu-%lu p%u sw%lu",
         (unsigned long)(app->f_start / 1000000),
         (unsigned long)(app->f_end / 1000000),
+        (unsigned)(app->page + 1),
         (unsigned long)app->sweeps);
     canvas_draw_str(canvas, 2, 8, hdr);
 
-    char pk[48];
-    const FreqBand* bn = band_lookup(pfreq);
-    if(bn) {
-        // compact "<freq> <dBm> ~<band> <AM/FM>" so the tag fits one 128px line
-        snprintf(
-            pk,
-            sizeof(pk),
-            "%lu.%lu %d ~%s %s",
-            (unsigned long)(pfreq / 1000000),
-            (unsigned long)((pfreq / 100000) % 10),
-            pmax,
-            bn->name,
-            mod_str(bn->mod));
+    // info line: cursor readout on bars, global peak otherwise
+    if(app->page == 0) {
+        int8_t cur, pk;
+        col_max(app, app->cursor, &cur, &pk);
+        draw_info(canvas, col_freq(app, app->cursor), cur);
     } else {
-        snprintf(
-            pk,
-            sizeof(pk),
-            "%lu.%lu MHz  %d dBm",
-            (unsigned long)(pfreq / 1000000),
-            (unsigned long)((pfreq / 100000) % 10),
-            pmax);
-    }
-    canvas_draw_str(canvas, 2, 18, pk);
-
-    // bars: each column spans nbins/SCR_W bins; take the MAX over that span so a peak
-    // between bins isn't skipped when the range is wide (e.g. full spectrum downsample)
-    for(int px = 0; px < SCR_W; px++) {
-        uint32_t b0 = (uint32_t)px * app->nbins / SCR_W;
-        uint32_t b1 = (uint32_t)(px + 1) * app->nbins / SCR_W;
-        if(b1 <= b0) b1 = b0 + 1;
-        if(b1 > app->nbins) b1 = app->nbins;
-        int8_t cur = -128, pk2 = -128;
-        for(uint32_t b = b0; b < b1; b++) {
-            if(app->rssi[b] > cur) cur = app->rssi[b];
-            if(app->peak[b] > pk2) pk2 = app->peak[b];
+        int pmax = -200;
+        uint16_t pidx = 0;
+        for(uint16_t i = 0; i < app->nbins; i++) {
+            if(app->rssi[i] > pmax) {
+                pmax = app->rssi[i];
+                pidx = i;
+            }
         }
-        int h = bar_h(cur);
-        if(h > 0) canvas_draw_line(canvas, px, BASE_Y, px, BASE_Y - h);
-        int ph = bar_h(pk2);
-        if(ph > 0) canvas_draw_dot(canvas, px, BASE_Y - ph);
+        draw_info(canvas, app->f_start + (uint32_t)pidx * app->f_step, pmax);
     }
-    canvas_draw_line(canvas, 0, BASE_Y + 1, SCR_W - 1, BASE_Y + 1);
 
-    // frequency axis (start / end)
-    char fa[12];
-    snprintf(fa, sizeof(fa), "%lu", (unsigned long)(app->f_start / 1000000));
-    canvas_draw_str(canvas, 2, 63, fa);
-    snprintf(fa, sizeof(fa), "%lu", (unsigned long)(app->f_end / 1000000));
-    canvas_draw_str(canvas, SCR_W - 20, 63, fa);
+    if(app->page == 0)
+        draw_bars(canvas, app);
+    else if(app->page == 1)
+        draw_waterfall(canvas, app);
+    else
+        draw_numeric(canvas, app);
+
+    // native pill hints
+    elements_button_left(canvas, "Page");
+    if(app->page == 0) elements_button_center(canvas, "Zoom");
+    if(app->zdepth) elements_button_right(canvas, "Out");
 }
 
-static bool bars_input(InputEvent* event, void* context) {
+static bool spectrum_input(InputEvent* event, void* context) {
     UNUSED(context);
-    if(event->type == InputTypeShort && event->key == InputKeyBack) return false; // -> exit
+    App* app = g_app;
+    if(!app) return false;
+    bool sp = (event->type == InputTypeShort);
+    bool lp = (event->type == InputTypeLong);
+
+    if(event->key == InputKeyBack && sp) {
+        if(app->zdepth) {
+            zoom_out(app);
+            spec_redraw(app);
+            return true;
+        }
+        return false; // -> config
+    }
+    if(event->key == InputKeyLeft && (sp || lp)) {
+        if(sp && app->page == 0 && app->cursor > 0)
+            app->cursor--; // move cursor
+        else
+            app->page = (uint8_t)((app->page + 2) % 3); // edge / long -> prev page
+        spec_redraw(app);
+        return true;
+    }
+    if(event->key == InputKeyRight && (sp || lp)) {
+        if(sp && app->page == 0 && app->cursor < SCR_W - 1)
+            app->cursor++;
+        else
+            app->page = (uint8_t)((app->page + 1) % 3); // edge / long -> next page
+        spec_redraw(app);
+        return true;
+    }
+    if(event->key == InputKeyOk && sp && app->page == 0) {
+        zoom_in(app, app->cursor); // click the framed band -> zoom in
+        spec_redraw(app);
+        return true;
+    }
     return true;
 }
 
@@ -288,6 +495,13 @@ static void band_cb(VariableItem* item) {
     app->f_end = b->hi;
     app->mod = b->mod;
     app->reconfig = true;
+    FURI_LOG_I(
+        TAG,
+        "config: band[%u]=%s %lu-%lu",
+        idx,
+        b->name,
+        (unsigned long)b->lo,
+        (unsigned long)b->hi);
     // reflect the chosen band into the range readout and the modulation item
     char r[24];
     snprintf(
@@ -319,6 +533,7 @@ static void step_cb(VariableItem* item) {
 static void conf_enter(void* ctx, uint32_t index) {
     UNUSED(index);
     App* app = ctx;
+    FURI_LOG_I(TAG, "config: OK -> spectrum");
     view_dispatcher_switch_to_view(app->vd, VIEW_SPEC); // OK starts the scan
 }
 
@@ -332,8 +547,12 @@ static void redraw_cb(void* ctx) {
 
 int32_t rf_survey_app(void* p) {
     UNUSED(p);
+    FURI_LOG_I(TAG, "app: start (sizeof App=%u)", (unsigned)sizeof(App));
     App* app = malloc(sizeof(App));
-    if(!app) return -1;
+    if(!app) {
+        FURI_LOG_E(TAG, "app: malloc failed");
+        return -1;
+    }
     memset(app, 0, sizeof(App));
     g_app = app;
 
@@ -343,6 +562,7 @@ int32_t rf_survey_app(void* p) {
     app->f_step = 650000;
     app->settle_ms = 3;
     app->mod = ModFM; // matches the default "Full high" band preset
+    app->cursor = SCR_W / 2;
     // defensive against bad config (future editable ranges): never div-by-zero,
     // never an inverted range, always 1..MAX_BINS bins, and keep f_end consistent
     // with the bins actually scanned so the axis labels can't lie.
@@ -366,8 +586,8 @@ int32_t rf_survey_app(void* p) {
     app->view = view_alloc();
     view_allocate_model(app->view, ViewModelTypeLockFree, sizeof(void*));
     view_set_context(app->view, app);
-    view_set_draw_callback(app->view, bars_draw);
-    view_set_input_callback(app->view, bars_input);
+    view_set_draw_callback(app->view, spectrum_draw);
+    view_set_input_callback(app->view, spectrum_input);
     view_set_previous_callback(app->view, to_conf);
     view_dispatcher_add_view(app->vd, VIEW_SPEC, app->view);
 
@@ -398,8 +618,10 @@ int32_t rf_survey_app(void* p) {
     app->redraw = furi_timer_alloc(redraw_cb, FuriTimerTypePeriodic, app);
     furi_timer_start(app->redraw, 150);
 
+    FURI_LOG_I(TAG, "app: views ready, worker+timer up, entering dispatcher");
     view_dispatcher_switch_to_view(app->vd, VIEW_CONF); // land on config
     view_dispatcher_run(app->vd);
+    FURI_LOG_I(TAG, "app: dispatcher returned, tearing down");
 
     // teardown order: stop the redraw timer (no more draw callbacks), then stop and
     // join the worker (no more radio/buffer writes), only then free views and data.
@@ -417,5 +639,6 @@ int32_t rf_survey_app(void* p) {
     furi_record_close(RECORD_GUI);
     g_app = NULL; // defensive: a stray draw after this sees NULL, not freed memory
     free(app);
+    FURI_LOG_I(TAG, "app: end");
     return 0;
 }
