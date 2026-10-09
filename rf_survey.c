@@ -432,6 +432,29 @@ static const NotificationSequence seq_vibro_tick = {
     NULL,
 };
 
+// defined later; the worker needs them for the "selected frequency" haptic
+static uint32_t grp_freq(const App* app, uint16_t k);
+static void numeric_top4(const App* app, int tv[4], uint16_t tb[4]);
+
+// vibro gap (ms) for an RSSI relative to the Trigger: stronger -> faster ticks. 0 = don't tick.
+static uint16_t haptic_gap(const App* app, int8_t r) {
+    if(r <= app->trigger) return 0;
+    uint8_t over = (uint8_t)(r - app->trigger);
+    return over >= 20 ? 100 : over >= 12 ? 200 : over >= 6 ? 330 : 480;
+}
+
+// the frequency the user has SELECTED to home in on: the numeric page's chosen top-4 target,
+// otherwise the bars cursor's grouped-bar center.
+static uint32_t selected_freq(const App* app) {
+    if(app->page == 3) {
+        int tv[4];
+        uint16_t tb[4];
+        numeric_top4(app, tv, tb);
+        if(tv[app->num_sel] > -200) return app->f_start + (uint32_t)tb[app->num_sel] * app->f_step;
+    }
+    return grp_freq(app, app->cursor);
+}
+
 // ---- radio sweep worker ----------------------------------------------------
 
 static int32_t sweep_worker(void* ctx) {
@@ -545,15 +568,27 @@ static int32_t sweep_worker(void* ctx) {
         if((app->sweeps & 0x0F) == 0)
             FURI_LOG_D(TAG, "worker: sweep %lu", (unsigned long)app->sweeps);
 
-        // above-trigger peak this sweep -> haptic cue + busy-channel history
-        if(smax > app->trigger) {
-            hist_add(app, (uint16_t)((fs + (uint32_t)smaxi * st) / 1000000));
-            // haptic locate cue: a short vibro tick, more often the stronger it is
-            // (Geiger-style). Only while the spectrum is on screen -- not during config setup.
-            if(app->haptic && app->notif && app->spec_active) {
-                uint8_t over = (uint8_t)(smax - app->trigger);
-                uint8_t every = over >= 20 ? 1 : over >= 12 ? 2 : over >= 6 ? 3 : 4;
-                if((app->sweeps % every) == 0) notification_message(app->notif, &seq_vibro_tick);
+        // above-trigger peak this sweep -> busy-channel history
+        if(smax > app->trigger) hist_add(app, (uint16_t)((fs + (uint32_t)smaxi * st) / 1000000));
+
+        // responsive haptic locate: tick on the frequency the USER SELECTED (the bars cursor or
+        // the numeric page's chosen target), not the strongest bin -- the point is to home in on
+        // the band you picked. Re-read just that one frequency fast and tick at a rate that tracks
+        // its strength, decoupled from the slow full-sweep period so it reacts at once instead of
+        // once per sweep. Bounded to ~0.5 s so the display still refreshes; stops as soon as the
+        // selected frequency drops below the trigger. Only while the spectrum is shown.
+        if(app->haptic && app->notif && app->spec_active) {
+            uint32_t sel_f = selected_freq(app);
+            uint32_t t_end = furi_get_tick() + 500;
+            while(app->running && app->haptic && app->spec_active && furi_get_tick() < t_end) {
+                if(!tune_rx(sel_f)) break;
+                furi_delay_ms(app->settle_ms);
+                float rf = furi_hal_subghz_get_rssi();
+                int8_t r = (rf < -127.0f) ? (int8_t)-127 : (int8_t)rf;
+                uint16_t gap = haptic_gap(app, r);
+                if(!gap) break; // selected freq quiet -> stop, resume sweeping
+                notification_message(app->notif, &seq_vibro_tick);
+                furi_delay_ms(gap);
             }
         }
 
@@ -1375,6 +1410,7 @@ static int32_t capture_worker(void* ctx) {
         int ind = 0;
         bool werr = false;
         uint32_t last_poll = 0;
+        uint32_t last_vibro = 0;
         app->cap_paused = app->cap_gate; // if gating, wait for signal before the first write
         while(app->capturing && !werr && app->cap_samples < CAP_MAXSPL) {
             // poll the level ~50 Hz for the on-screen readout; only PAUSE writing when the gate
@@ -1385,6 +1421,15 @@ static int32_t capture_worker(void* ctx) {
                 app->cap_rssi = (r < -127.0f) ? (int8_t)-127 : (int8_t)r;
                 app->cap_paused = app->cap_gate && (app->cap_rssi < app->trigger);
                 last_poll = now;
+                // same strength-tracked locate cue as the spectrum, but NON-blocking: this loop
+                // must keep draining the stream buffer, so just tick when the gap has elapsed.
+                if(app->haptic && app->notif) {
+                    uint16_t gap = haptic_gap(app, app->cap_rssi);
+                    if(gap && now - last_vibro >= gap) {
+                        notification_message(app->notif, &seq_vibro_tick);
+                        last_vibro = now;
+                    }
+                }
             }
             int32_t d;
             if(furi_stream_buffer_receive(app->cap_stream, &d, sizeof(d), 20) == sizeof(d)) {
