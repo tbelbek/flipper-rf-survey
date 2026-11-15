@@ -117,6 +117,18 @@ static struct {
         },
 };
 
+// furi_hal_region_set() takes ownership: it free()s the region it replaces. So every region
+// handed to it must be a heap block of its own -- never s_region (a FAP static) and never the
+// pointer furi_hal_region_get() returned before a set (the set frees it). Handing it either
+// left the device on a freed region after exit (garbage country code, garbage TX band check
+// in every app until reboot) and free()d memory that was never malloc()ed.
+static FuriHalRegion* region_dup(const FuriHalRegion* r) {
+    size_t n = sizeof(FuriHalRegion) + r->bands_count * sizeof(FuriHalRegionBand);
+    FuriHalRegion* c = malloc(n);
+    memcpy(c, r, n);
+    return c;
+}
+
 // non-NULL => the external radio (cc1101_ext) is the active owner; NULL => internal furi_hal.
 // Set by radio_setup(), cleared by radio_teardown(). Only the single current worker touches the
 // radio (sweep and capture are strictly sequential), so this file-static has one owner at a time.
@@ -4397,9 +4409,13 @@ int32_t rf_survey_app(void* p) {
     view_set_previous_callback(app->help_view, to_conf);
     view_dispatcher_add_view(app->vd, VIEW_HELP, app->help_view);
 
-    // install the permissive region for the scan (RX only); restored on exit
-    const FuriHalRegion* orig_region = furi_hal_region_get();
-    furi_hal_region_set((FuriHalRegion*)&s_region);
+    // install the permissive region for the scan (RX only); restored on exit. Copy the user's
+    // region BEFORE the set, which frees it. NULL (never provisioned) allows no band, and the
+    // set API refuses NULL, so it comes back as an empty region, which also allows none.
+    const FuriHalRegion* cur_region = furi_hal_region_get();
+    static const FuriHalRegion none = {.country_code = {'-', '-', 0, 0}, .bands_count = 0};
+    FuriHalRegion* orig_region = region_dup(cur_region ? cur_region : &none);
+    furi_hal_region_set(region_dup((const FuriHalRegion*)&s_region));
     FURI_LOG_I(TAG, "app: region set permissive (was %s)", furi_hal_region_get_name());
 
     app->running = true;
@@ -4438,7 +4454,7 @@ int32_t rf_survey_app(void* p) {
         furi_thread_join(app->worker);
         furi_thread_free(app->worker);
     }
-    furi_hal_region_set((FuriHalRegion*)orig_region); // restore the user's region
+    furi_hal_region_set(orig_region); // restore the user's region; frees our permissive copy
     { // persist this session's config for the next launch
         Storage* st = furi_record_open(RECORD_STORAGE);
         settings_save(app, st, SETTINGS_PATH);
